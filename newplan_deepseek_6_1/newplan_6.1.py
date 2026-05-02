@@ -1325,17 +1325,29 @@ class PlannerEngine:
         )
 
     def _detect_relevant_tools(self, user_input: str, available: list) -> list:
-        """Figure out which tools are relevant to this task."""
         lower = user_input.lower()
+
+        # ── Simple file ops need no tool help ────────────────────
+        SIMPLE_OPS = [
+            "delete", "remove", "rm ", "mkdir", "copy", "cp ", "move",
+            "mv ", "rename", "touch", "chmod", "chown", "ln ", "cat ",
+            "ls ", "list files", "list dir", "show files",
+        ]
+        if any(op in lower for op in SIMPLE_OPS):
+            # Only fetch help if there's also a pentest/scan keyword
+            PENTEST = ["scan", "xss", "sql", "inject", "fuzz", "brute",
+                    "exploit", "recon", "enum", "crack", "hash"]
+            if not any(p in lower for p in PENTEST):
+                return []  # no tool help needed for plain file ops
+
         relevant = []
 
-        # Always include curl for web tasks
+        # web tasks
         web_keywords = ["xss", "sql", "inject", "http", "web", "url", "fuzz",
                         "scan", "recon", "dir", "path", "param", "test"]
         if any(k in lower for k in web_keywords):
             relevant += ["curl", "wget"]
 
-        # Tool-specific keywords
         tool_map = {
             "nmap":          ["port", "scan", "service", "version", "network", "host"],
             "ffuf":          ["fuzz", "dir", "path", "brute", "word"],
@@ -1370,19 +1382,19 @@ class PlannerEngine:
             "amass":         ["subdomain", "osint", "recon"],
             "dnsrecon":      ["dns", "domain", "zone"],
             "sherlock":      ["osint", "username", "social"],
-            "exiftool":      ["exif", "metadata", "image", "file"],
+            "exiftool":      ["exif", "metadata"],  # removed "image", "file" — too generic
         }
 
         for tool, keywords in tool_map.items():
             if tool in available and any(k in lower for k in keywords):
                 relevant.append(tool)
 
-        # Always add explicitly mentioned tools
+        # Only add explicitly mentioned tools by exact word boundary match
         for t in available:
-            if t.lower() in lower:
+            if re.search(rf'\b{re.escape(t.lower())}\b', lower):
                 relevant.append(t)
 
-        return list(dict.fromkeys(relevant))  # preserve order, dedupe
+        return list(dict.fromkeys(relevant))
 
     def _build_system_ctx(self, profile: dict, tool_help: str, wordlists: dict) -> str:
         tools_str = ", ".join(profile.get("available_tools", [])) or "standard linux tools"
