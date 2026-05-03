@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# issue is some command not show output like cp mv other stuff in linux , in that case it shows error when the command successfull let the ai generate "NO-OUT" for those command so its not wait for the output
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║              HACKERS AI — Advanced Linux Agent               ║
@@ -70,27 +71,10 @@ class FreeLLM:
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-            # Anthropic-style response: content[].text
-            for block in body.get("content", []):
-                if block.get("type") == "text":
-                    return block["text"]
-            return ""
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"[FreeLLM] Cannot reach proxy at {PROXY_BASE_URL}. "
-                f"Is server.py running?  ({e})"
-            )
-        except Exception as e:
-            raise RuntimeError(f"[FreeLLM] Request failed: {e}")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
             for block in body.get("content", []):
                 if block.get("type") == "text":
                     text = block["text"]
-                    # Fix markdown hyperlink corruption from scraper/renderer
-                    # e.g. [datetime.now](http://datetime.now) → datetime.now
-                    text = re.sub(r'\[([^\]]+)\]\(http[^\)]*\)', r'\1', text)
+                    text = re.sub(r'\[([^\]]+)\]\([^\)]*\)', r'\1', text)
                     return text
             return ""
         except urllib.error.URLError as e:
@@ -857,48 +841,55 @@ class PythonExecutor:
     def _clean_code(raw: str) -> str:
         if not raw:
             return ""
+
         raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
-        # ── Fix markdown hyperlinks corrupting code ───────────────
-        # e.g. [datetime.now](http://datetime.now) → datetime.now
-        # e.g. [some.func](http://anything) → some.func
-        raw = re.sub(r'\[([^\]]+)\]\(http[^\)]*\)', r'\1', raw)
+        # Fix markdown link corruption
+        raw = re.sub(r'\[([^\]]+)\]\([^\)]*\)', r'\1', raw)
 
-        # Extract from ```python ... ``` fence first
-        fence_match = re.search(r"```python\s*(.*?)\s*```", raw, re.DOTALL | re.IGNORECASE)
+        raw = raw.strip()
+
+        # ── Extract code from fence ──
+        fence_match = re.search(r'```[^\n]*\n(.*?)(?:```|$)', raw, re.DOTALL)
         if fence_match:
-            raw = fence_match.group(1).strip()
+            # Check if fence line has content after ``` (e.g. ```#!/usr/bin/env python3)
+            fence_line = re.search(r'```([^\n]+)\n', raw)
+            if fence_line:
+                tag = fence_line.group(1).strip()
+                # If it's not a language tag, it's actual code (e.g. shebang)
+                if tag and not re.match(r'^[a-zA-Z0-9]+$', tag):
+                    raw = tag + "\n" + fence_match.group(1).strip()
+                else:
+                    raw = fence_match.group(1).strip()
+            else:
+                raw = fence_match.group(1).strip()
         else:
-            raw = re.sub(r"^[ \t]*```[a-zA-Z0-9]*[ \t]*\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\n?[ \t]*```[ \t]*$", "", raw)
             raw = raw.strip()
 
         if not raw:
             return ""
 
-        lines = raw.splitlines()
-        start_idx = 0
-        for i, line in enumerate(lines):
-            s = line.strip()
-            if not s:
+        # ── Drop bare language tag lines ──
+        cleaned_lines = []
+        for line in raw.splitlines():
+            if line.strip() in ("python", "python3", "py"):
                 continue
-            if (s.startswith(("import ", "from ", "def ", "class ", "if ", "for ",
-                            "while ", "with ", "try:", "async ", "@", "#!")) or
-                    re.match(r'^[A-Za-z_]\w*\s*[=(\[]', s)):
-                start_idx = i
-                break
-        lines = lines[start_idx:]
-        raw = "\n".join(lines).strip()
-        if not raw:
+            cleaned_lines.append(line)
+
+        raw = "\n".join(cleaned_lines)
+
+        if not raw.strip():
             return ""
 
+        # ── Fix tabs → 4 spaces ──
         fixed = []
         for line in raw.splitlines():
-            stripped = line.lstrip("\t")
-            n_tabs   = len(line) - len(stripped)
+            stripped  = line.lstrip("\t")
+            n_tabs    = len(line) - len(stripped)
             stripped2 = stripped.lstrip(" ")
             n_spaces  = len(stripped) - len(stripped2)
             fixed.append("    " * n_tabs + " " * n_spaces + stripped2)
+
         return "\n".join(fixed).rstrip("\n") + "\n"
 
     @staticmethod
@@ -946,9 +937,11 @@ class PythonExecutor:
             tempfile.gettempdir(),
             f"hackers_ai_{os.getpid()}_{int(time.time() * 1000)}.py"
         )
+
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(code)
+
         try:
-            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(code)
             result = self.executor.run(
                 f"python3 {shlex.quote(tmp_path)}", timeout=120,
                 cwd=cwd if (cwd and os.path.isdir(cwd)) else None
@@ -958,6 +951,7 @@ class PythonExecutor:
                 os.unlink(tmp_path)
             except Exception:
                 pass
+
         return result
 
     def run(self, code: str, cwd: str = None) -> dict:
@@ -1305,6 +1299,73 @@ class PlannerEngine:
         "<details open ontoggle=alert(1)>",
     ]
 
+    
+    def plan_next(self, original_task: str, completed_steps: list,
+              profile: dict, model: str = DEFAULT_MODEL) -> Optional[dict]:
+        """
+        Given completed step outputs, generate the next batch of steps.
+        completed_steps: [{"id": 1, "desc": "...", "output": "..."}]
+        """
+        completed_str = "\n".join(
+            f"Step {s['id']} — {s['desc']}:\n{s['output'][:800]}"
+            for s in completed_steps
+        )
+
+        available_tools = profile.get("available_tools", [])
+        relevant        = self._detect_relevant_tools(original_task, available_tools)
+        tool_help       = self._fetch_tools_help(relevant)
+        wordlists       = WordlistFinder().scan()
+        system_ctx      = self._build_system_ctx(profile, tool_help, wordlists)
+        system_ctx     += tool_help
+
+        prompt = (
+            system_ctx + "\n\n"
+            f"ORIGINAL TASK: {original_task}\n\n"
+            f"COMPLETED STEPS AND THEIR REAL OUTPUT:\n{completed_str}\n\n"
+            "Based on the actual output above, generate ONLY the next required steps.\n"
+            "Use the real output values directly in commands — do not re-run completed steps.\n"
+            "If the task is fully complete, return an empty steps array: {\"steps\": []}\n"
+            "RESPOND WITH ONLY A ```json ... ``` fenced block."
+        )
+
+        for attempt in range(1, 4):
+            try:
+                agent = FreeLLM(model=model)
+                raw   = agent.ask(prompt)
+
+                parsed_check = extract_json(raw)
+                if parsed_check and "ready" in parsed_check and "steps" not in parsed_check:
+                    prompt += "\n\n[ERROR]: Return a plan with steps array, not a context response."
+                    continue
+
+                plan = extract_json(raw)
+                if plan is not None and isinstance(plan.get("steps"), list):
+                    filtered = []
+                    for step in plan["steps"]:
+                        desc_lower = (step.get("description") or "").lower()
+                        FORBIDDEN_DESCS = [
+                            "analyze result", "analyse result",
+                            "summarize result", "summarise result",
+                            "review result", "check result",
+                            "generate report from result",
+                        ]
+                        if step.get("type") == "python" and any(
+                            desc_lower == phrase or desc_lower.startswith(phrase)
+                            for phrase in FORBIDDEN_DESCS
+                        ):
+                            continue
+                        if step.get("type") == "python":
+                            if not step.get("description"):
+                                step["description"] = original_task
+                            step["command"] = ""
+                        filtered.append(step)
+                    plan["steps"] = filtered
+                    return plan
+            except Exception as e:
+                print(c("red", f"  [Planner] plan_next attempt {attempt} error: {e}"))
+
+        return None
+
     def _fetch_tools_help(self, tools_needed: list) -> str:
         """Silently fetch help for all relevant tools, return formatted string."""
         inspector = ToolInspector()
@@ -1471,9 +1532,18 @@ RULE: NEVER skip Phase 1. NEVER add a step just to "analyze results" —
 7. python type steps: type="python", command="" (empty), description="what to do"
 8. FORBIDDEN steps: type=python for "analyze","summarize","report","check results"
    These are handled automatically — NEVER add them.
-9. depends_on: [] for independent steps, [id] only if step needs prior output file
+9. depends_on: [] for independent steps, [id] only if step needs prior output
+   IMPORTANT: If a later step needs to USE the output/result of a prior step
+   (e.g. parse it, read a file it created, make decisions based on it),
+   use type="python" for that step — shell commands cannot read prior stdout.
+   Example: step 1 identifies hash type → step 2 must be python type to
+   parse that output and choose the correct hashcat -m mode dynamically.
 10. For wordlists: use ONLY paths from AVAILABLE WORDLISTS section above
     If no wordlist found for that category, omit the -w flag and note it.
+11. ADAPTIVE steps: if a step's command depends on the RESULT of a previous
+    step (not just a file), make it type="python" so it can subprocess the
+    prior result and decide what to run. Never hardcode values that should
+    come from prior step output.
 
 ═══ OUTPUT FORMAT — CRITICAL ═══
 YOUR ENTIRE RESPONSE MUST BE EXACTLY THIS — NOTHING ELSE:
@@ -1549,10 +1619,16 @@ warning: null or string (not the string "null")
                     filtered = []
                     for step in plan["steps"]:
                         desc_lower = (step.get("description") or "").lower()
-                        # Drop forbidden analysis steps
+                        # Drop forbidden analysis-only steps — use exact phrases not partial matches
+                        FORBIDDEN_DESCS = [
+                            "analyze result", "analyse result",
+                            "summarize result", "summarise result",
+                            "review result", "check result",
+                            "generate report from result",
+                        ]
                         if step.get("type") == "python" and any(
-                            w in desc_lower for w in
-                            ["analyz", "summariz", "report", "check result", "review result"]
+                            desc_lower == phrase or desc_lower.startswith(phrase)
+                            for phrase in FORBIDDEN_DESCS
                         ):
                             print(c("dim", f"  [Planner] Dropped forbidden python step: {desc_lower[:60]}"))
                             continue
@@ -1659,6 +1735,7 @@ class ExecutionEngine:
         steps      = [s for s in plan.get("steps", []) if s.get("type") != "info"]
         info_steps = [s for s in plan.get("steps", []) if s.get("type") == "info"]
         results    = {}
+        step_stdout = {}  # ← store stdout of each step by id
 
         for s in info_steps:
             sid = s.get("id", "?")
@@ -1680,6 +1757,16 @@ class ExecutionEngine:
                 self._lprint(c("cyan", f"\n  ▶ Step {sid}: ") + c("white", desc))
 
                 if cmd or stype == "python":
+                    # ── Inject prior step outputs into python desc ──
+                    if stype == "python" and step_stdout:
+                        prior = "\n".join(
+                            f"[Step {k} output]:\n{v}"
+                            for k, v in step_stdout.items()
+                            if v.strip()
+                        )
+                        if prior:
+                            desc = f"{desc}\n\nPRIOR STEP OUTPUTS (use these directly, do not re-run commands to get them):\n{prior}"
+
                     result = self._run_with_healing(
                         cmd, stype, task_id, sid, step.get("tool",""), desc=desc
                     )
@@ -1687,9 +1774,15 @@ class ExecutionEngine:
                         if not self._ask_continue():
                             self._abort = True
                             break
+
+                    # ── Store stdout for next steps ──────────────
+                    step_stdout[sid] = result.get("stdout", "").strip()
+
                     out = result["stdout"][:2500] or result["stderr"][:500]
                     results[sid] = f"[Step {sid} — {desc}]\n$ {result['command']}\n{out}"
+
             else:
+                # parallel batch — unchanged
                 self._lprint(c("magenta",
                     f"\n  ⚡ Running {len(batch)} steps in parallel (batch {batch_idx+1}/{len(batches)})"))
                 for i, s in enumerate(batch):
@@ -1714,6 +1807,7 @@ class ExecutionEngine:
                     )
                     out = result["stdout"][:2500] or result["stderr"][:500]
                     br[sid] = f"[Step {sid} — {desc}]\n$ {result['command']}\n{out}"
+                    step_stdout[sid] = result.get("stdout", "").strip()
 
                 for step_item in batch:
                     t = threading.Thread(target=_worker, args=(step_item,), daemon=True)
@@ -1737,7 +1831,7 @@ class ExecutionEngine:
                 self._lprint(c("green", f"  ✓ Batch done — {done}/{len(batch)} completed"))
 
         ordered = [results[s.get("id")] for s in plan.get("steps", []) if s.get("id") in results]
-        return "\n\n".join(ordered) if ordered else "No steps were executed."
+        return "\n".join(ordered) if ordered else "No steps were executed."
 
     def _ask_continue(self) -> bool:
         print()
@@ -1972,6 +2066,83 @@ class ExecutionEngine:
 
         _lp(c("red", f"  ✗ Step {step_id} exhausted all recovery phases."))
         return result
+
+class DynamicExecutionEngine:
+    def __init__(self, memory: MemoryDB, model: str = DEFAULT_MODEL):
+        self.memory  = memory
+        self.model   = model
+        self.engine  = ExecutionEngine(memory, model)
+        self.planner = PlannerEngine()
+
+    def run(self, original_task: str, initial_plan: dict,
+            task_id: str, profile: dict) -> str:
+
+        self.engine._cwd        = self.engine._cwd
+        self.engine._user_input = original_task
+        completed   = []   # {"id", "desc", "output"}
+        all_results = []
+        step_offset = 0    # keep ids unique across rounds
+
+        steps = initial_plan.get("steps", [])
+
+        while True:
+            if not steps:
+                break
+
+            # Split into independent and dependent
+            independent = [s for s in steps if not s.get("depends_on")]
+            dependent   = [s for s in steps if s.get("depends_on")]
+
+            if not independent:
+                # All remaining are dependent — run them with current outputs
+                independent = steps
+                dependent   = []
+
+            print(c("cyan", f"\n  ⚡ Running {len(independent)} independent step(s)..."))
+
+            # Execute independent steps
+            mini_plan = {**initial_plan, "steps": independent}
+            raw       = self.engine.execute_plan(mini_plan, task_id)
+            all_results.append(raw)
+
+            # Collect outputs
+            for step in independent:
+                sid  = step.get("id")
+                desc = step.get("description", "")
+                # Extract stdout from engine's internal log
+                with sqlite3.connect(self.memory.db_path) as conn:
+                    row = conn.execute(
+                        "SELECT output FROM task_memory WHERE task_id=? AND step=? ORDER BY id DESC LIMIT 1",
+                        (task_id, sid)
+                    ).fetchone()
+                output = row[0] if row else ""
+                completed.append({"id": sid, "desc": desc, "output": output})
+
+            if not dependent and not completed:
+                break
+
+            # Check if there are dependent steps remaining
+            if not dependent:
+                # Ask AI if task needs more steps based on output
+                print(c("dim", "\n  [→] Checking if more steps needed..."))
+                next_plan = self.planner.plan_next(
+                    original_task, completed, profile, self.model
+                )
+                if not next_plan or not next_plan.get("steps"):
+                    print(c("green", "  ✓ Task complete."))
+                    break
+                steps = next_plan["steps"]
+            else:
+                # Generate dependent steps with real output injected
+                print(c("dim", "\n  [→] Generating dependent steps with real output..."))
+                next_plan = self.planner.plan_next(
+                    original_task, completed, profile, self.model
+                )
+                if not next_plan or not next_plan.get("steps"):
+                    break
+                steps = next_plan["steps"]
+
+        return "\n\n".join(all_results) if all_results else "No steps executed."
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 16 — SUMMARIZER
@@ -2799,12 +2970,12 @@ class CLI:
             print(c("red", "\n  ✗ Task aborted.\n"))
             return
 
-        # Execute
-        task_id            = datetime.now().strftime("%Y%m%d_%H%M%S")
-        engine             = ExecutionEngine(self.memory, model=self.model)
-        engine._cwd        = self.cwd
-        engine._user_input = enriched
-        raw                = engine.execute_plan(plan, task_id)
+        # Execute dynamically
+        task_id     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dyn_engine  = DynamicExecutionEngine(self.memory, model=self.model)
+        dyn_engine.engine._cwd        = self.cwd
+        dyn_engine.engine._user_input = enriched
+        raw         = dyn_engine.run(enriched, plan, task_id, self.profile)
 
         # Summarize
         print(c("dim", "\n  [→] Summarizing..."))
