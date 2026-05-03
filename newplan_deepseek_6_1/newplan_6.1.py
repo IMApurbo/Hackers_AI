@@ -1777,164 +1777,202 @@ class ExecutionEngine:
         self.memory.log_task_step(task_id, step_id, tool, cmd, stdout[:2000], status)
 
     def _run_with_healing(self, command: str, stype: str,
-                            task_id: str, step_id, tool: str,
-                            label: str = "", lock: threading.Lock = None,
-                            desc: str = "") -> dict:
-            history       = self.memory.get_history(4)
-            _lp           = (lambda m: _locked_print(lock, m)) if lock else print
-            real_home     = self._get_real_home()
-            effective_cwd = self._cwd if (self._cwd and os.path.isdir(self._cwd)) else None
-            result        = {"success": False, "stdout": "", "stderr": "",
-                            "returncode": -1, "elapsed": 0, "cancelled": False,
-                            "command": command}
-            last_err = ""
+                        task_id: str, step_id, tool: str,
+                        label: str = "", lock: threading.Lock = None,
+                        desc: str = "") -> dict:
+        history       = self.memory.get_history(4)
+        _lp           = (lambda m: _locked_print(lock, m)) if lock else print
+        real_home     = self._get_real_home()
+        effective_cwd = self._cwd if (self._cwd and os.path.isdir(self._cwd)) else None
+        result        = {"success": False, "stdout": "", "stderr": "",
+                        "returncode": -1, "elapsed": 0, "cancelled": False,
+                        "command": command}
+        last_err = ""
 
-            # ── Install fast-path ─────────────────────────────────
-            if stype != "python" and self._is_install_cmd(command):
-                pkg = self._extract_pkg(command)
-                _lp(c("cyan", f"\n  [Installer] → {command}"))
-                ok, method, _ = self.analyzer.installer.install(pkg)
-                self._log(task_id, step_id, tool, command, "", "success" if ok else "failed")
-                if ok:
-                    return {"success": True, "stdout": f"Installed {pkg} via {method}",
-                            "stderr": "", "returncode": 0, "elapsed": 0,
-                            "cancelled": False, "command": command}
-                return {"success": False, "stdout": "", "stderr": f"Install failed: {pkg}",
-                        "returncode": 1, "elapsed": 0, "cancelled": False, "command": command}
+        # ── Install fast-path ─────────────────────────────────
+        if stype != "python" and self._is_install_cmd(command):
+            pkg = self._extract_pkg(command)
+            _lp(c("cyan", f"\n  [Installer] → {command}"))
+            ok, method, _ = self.analyzer.installer.install(pkg)
+            self._log(task_id, step_id, tool, command, "", "success" if ok else "failed")
+            if ok:
+                return {"success": True, "stdout": f"Installed {pkg} via {method}",
+                        "stderr": "", "returncode": 0, "elapsed": 0,
+                        "cancelled": False, "command": command}
+            return {"success": False, "stdout": "", "stderr": f"Install failed: {pkg}",
+                    "returncode": 1, "elapsed": 0, "cancelled": False, "command": command}
 
-            # ── Phase 1: run + self-heal retries ──────────────────
-            for attempt in range(1, MAX_RETRIES + 1):
-                if stype == "python":
-                    retry_task = desc or command[:120]
-                    if attempt > 1:
-                        retry_task += f"\nPrevious error: {last_err[:200]}"
-                    result = self.py_exec.generate_and_run(
-                        task=retry_task,
-                        user_input=getattr(self, "_user_input", command) or command,
-                        cwd=effective_cwd or "/root",
-                        model=self.model,
-                    )
-                else:
-                    _cmd = self._expand_tilde(command, real_home)
-                    _GUI = {
-                        "firefox","chromium","chromium-browser","google-chrome",
-                        "brave-browser","xdg-open","nautilus","thunar","dolphin",
-                        "vlc","mpv","gimp","inkscape","libreoffice","evince",
-                        "code","wireshark","burpsuite","zaproxy",
-                        "gedit","mousepad","kate","discord","slack","telegram",
-                    }
-                    _bin = _cmd.strip().split()[0].split("/")[-1] if _cmd.strip() else ""
-                    if _bin in _GUI:
-                        _cmd = CommandExecutor.as_user(_cmd)
-                    result = self.cmd_exec.run(
-                        _cmd, label=label, lock=lock, cwd=effective_cwd
-                    )
-
-                if result.get("cancelled"):
-                    return result
-
-                self._log(task_id, step_id, tool, command,
-                        result["stdout"], "success" if result["success"] else "error")
-
-                if result["success"]:
-                    return result
-
-                last_err = result["stderr"] or result["stdout"]
-
-                # ── Python steps: just retry with error, skip shell healing ──
-                if stype == "python":
-                    if attempt < MAX_RETRIES:
-                        _lp(c("yellow", f"  ⚠ Python attempt {attempt}/{MAX_RETRIES} failed — regenerating..."))
-                    continue
-
-                # ── Shell steps: permission bail ──────────────────
-                perm_err = any(kw in last_err.lower() for kw in [
-                    "permission denied", "operation not permitted",
-                    "authentication failure", "not in the sudoers",
-                ])
-                if perm_err:
-                    _lp(c("yellow", "  ⚠ Permission error — escalating..."))
-                    break
-
-                if attempt < MAX_RETRIES:
-                    _lp(c("yellow", f"  ⚠ Attempt {attempt}/{MAX_RETRIES} — rebuilding command..."))
-                    fixed = self.analyzer.analyze_and_fix(command, last_err, history)
-                    if fixed and fixed.strip() != command.strip():
-                        _lp(c("magenta", f"  ↺ Rebuilt: {fixed[:80]}"))
-                        command = fixed
-                    else:
-                        _lp(c("red", "  ✗ No fix found — escalating."))
-                        break
-
-            # Soft-error check
-            _out_lower = result.get("stdout", "").lower()
-            _err_lower = last_err.lower()
-            _soft_pats = [
-                "no such file or directory", "cannot access", "not found",
-                "no matches found", "0 directories, 0 files", "total 0",
-            ]
-            _is_soft = any(p in _err_lower or p in _out_lower for p in _soft_pats)
-            if _is_soft:
-                _lp(c("yellow", "  ⚠ Path not found or empty — reporting as-is."))
-                result["success"]    = True
-                result["stdout"]     = (last_err.strip() or result.get("stdout","").strip()
-                                        or "Directory not found or empty.")
-                result["returncode"] = 0
-                return result
-
-            # Python exhausted all retries — stop here, no shell fallback phases
-            if stype == "python":
-                _lp(c("red", f"  ✗ Step {step_id} — Python failed after {MAX_RETRIES} attempts."))
-                return result
-
-            _lp(c("red", "  ✗ Phase 1 exhausted — escalating..."))
-
-            # ── Phase 2: install missing tool ─────────────────────
-            clean    = self._strip_sudo(command)
-            bin_name = clean.split()[0].split("/")[-1] if clean.split() else ""
-            if bin_name and not shutil.which(bin_name):
-                _lp(c("yellow", f"  [Phase 2] '{bin_name}' not in PATH — installing..."))
+        # ── Pre-flight: check if the binary exists, install if not ──
+        if stype != "python" and command.strip():
+            bin_name = command.strip().split()[0].split("/")[-1]
+            if bin_name and not shutil.which(bin_name) and bin_name not in (
+                "echo", "cat", "ls", "rm", "mv", "cp", "mkdir", "chmod",
+                "chown", "touch", "grep", "awk", "sed", "find", "curl",
+                "wget", "ping", "ssh", "scp", "tar", "zip", "unzip",
+                "python3", "python", "bash", "sh", "which", "true", "false",
+            ):
+                _lp(c("yellow", f"\n  [Pre-flight] '{bin_name}' not found — installing before run..."))
                 ok, method, _ = self.analyzer.installer.install(bin_name)
                 if ok:
-                    _lp(c("green", f"  [Phase 2] ✓ Installed via {method} — retrying..."))
-                    result = self.cmd_exec.run(
-                        self._expand_tilde(clean, real_home),
-                        label=label, lock=lock, cwd=effective_cwd
-                    )
-                    self._log(task_id, step_id, tool, clean,
-                            result["stdout"], "success" if result["success"] else "error")
-                    if result["success"]:
-                        return result
-                    last_err = result["stderr"] or result["stdout"]
+                    _lp(c("green", f"  [Pre-flight] ✓ Installed {bin_name} via {method}"))
+                else:
+                    _lp(c("yellow", f"  [Pre-flight] ✗ Could not install {bin_name} — will try alternative"))
+                    # immediately jump to alternative, skip retry loop
+                    alt_cmd = self.analyzer.suggest_alternative(command, desc or command, f"{bin_name}: command not found")
+                    if alt_cmd:
+                        alt_bin = alt_cmd.strip().split()[0].split("/")[-1]
+                        if alt_bin and not shutil.which(alt_bin):
+                            _lp(c("dim", f"  [Pre-flight] Installing alt tool: {alt_bin}"))
+                            self.analyzer.installer.install(alt_bin)
+                        alt_cmd = self._expand_tilde(alt_cmd, real_home)
+                        _lp(c("cyan", f"  [Pre-flight] Alternative: {alt_cmd[:80]}"))
+                        result = self.cmd_exec.run(alt_cmd, label=label, lock=lock, cwd=effective_cwd)
+                        self._log(task_id, step_id, tool, alt_cmd,
+                                result["stdout"], "success" if result["success"] else "error")
+                        if result["success"]:
+                            return result
+                        last_err = result["stderr"] or result["stdout"]
+                        # fall through to normal retry loop with the alt command
+                        command = alt_cmd
 
-            # ── Phase 3: alternative command ──────────────────────
-            alt_cmd = self.analyzer.suggest_alternative(command, desc or command, last_err)
-            if alt_cmd:
-                alt_bin = alt_cmd.strip().split()[0].split("/")[-1]
-                if alt_bin and not shutil.which(alt_bin):
-                    _lp(c("dim", f"  [Phase 3] Installing alt tool: {alt_bin}"))
-                    self.analyzer.installer.install(alt_bin)
-                alt_cmd = self._expand_tilde(alt_cmd, real_home)
-                _lp(c("cyan", f"  [Phase 3] Alternative: {alt_cmd[:80]}"))
-                result = self.cmd_exec.run(alt_cmd, label=label, lock=lock, cwd=effective_cwd)
-                self._log(task_id, step_id, tool, alt_cmd,
-                        result["stdout"], "success" if result["success"] else "error")
-                if result["success"]:
-                    _lp(c("green", "  [Phase 3] ✓ Alternative succeeded"))
-                    return result
-                last_err = result["stderr"] or result["stdout"]
+        # ── Phase 1: run + self-heal retries ──────────────────
+        for attempt in range(1, MAX_RETRIES + 1):
+            if stype == "python":
+                retry_task = desc or command[:120]
+                if attempt > 1:
+                    retry_task += f"\nPrevious error: {last_err[:200]}"
+                result = self.py_exec.generate_and_run(
+                    task=retry_task,
+                    user_input=getattr(self, "_user_input", command) or command,
+                    cwd=effective_cwd or "/root",
+                    model=self.model,
+                )
+            else:
+                _cmd = self._expand_tilde(command, real_home)
+                _GUI = {
+                    "firefox","chromium","chromium-browser","google-chrome",
+                    "brave-browser","xdg-open","nautilus","thunar","dolphin",
+                    "vlc","mpv","gimp","inkscape","libreoffice","evince",
+                    "code","wireshark","burpsuite","zaproxy",
+                    "gedit","mousepad","kate","discord","slack","telegram",
+                }
+                _bin = _cmd.strip().split()[0].split("/")[-1] if _cmd.strip() else ""
+                if _bin in _GUI:
+                    _cmd = CommandExecutor.as_user(_cmd)
+                result = self.cmd_exec.run(
+                    _cmd, label=label, lock=lock, cwd=effective_cwd
+                )
 
-            # ── Phase 4: Python fallback ───────────────────────────
-            _lp(c("magenta", "  [Phase 4] Python fallback..."))
-            fb = PythonFallback(self.model, self.py_exec, self.cmd_exec)
-            result = fb.generate_and_run(command, desc or command, last_err, cwd=effective_cwd)
-            self._log(task_id, step_id, tool, f"[py-fallback]{command}",
-                    result["stdout"], "success" if result["success"] else "fallback_failed")
+            if result.get("cancelled"):
+                return result
+
+            self._log(task_id, step_id, tool, command,
+                    result["stdout"], "success" if result["success"] else "error")
+
             if result["success"]:
                 return result
 
-            _lp(c("red", f"  ✗ Step {step_id} exhausted all recovery phases."))
+            last_err = result["stderr"] or result["stdout"]
+
+            # ── Python steps: just retry with error, skip shell healing ──
+            if stype == "python":
+                if attempt < MAX_RETRIES:
+                    _lp(c("yellow", f"  ⚠ Python attempt {attempt}/{MAX_RETRIES} failed — regenerating..."))
+                continue
+
+            # ── Shell: skip retries if it's just command not found — already handled above ──
+            if "command not found" in last_err.lower() or "exit:127" in last_err.lower():
+                _lp(c("red", "  ✗ Binary still not found after install attempt — escalating."))
+                break
+
+            # ── Shell steps: permission bail ──────────────────
+            perm_err = any(kw in last_err.lower() for kw in [
+                "permission denied", "operation not permitted",
+                "authentication failure", "not in the sudoers",
+            ])
+            if perm_err:
+                _lp(c("yellow", "  ⚠ Permission error — escalating..."))
+                break
+
+            if attempt < MAX_RETRIES:
+                _lp(c("yellow", f"  ⚠ Attempt {attempt}/{MAX_RETRIES} — rebuilding command..."))
+                fixed = self.analyzer.analyze_and_fix(command, last_err, history)
+                if fixed and fixed.strip() != command.strip():
+                    _lp(c("magenta", f"  ↺ Rebuilt: {fixed[:80]}"))
+                    command = fixed
+                else:
+                    _lp(c("red", "  ✗ No fix found — escalating."))
+                    break
+
+        # Soft-error check
+        _out_lower = result.get("stdout", "").lower()
+        _err_lower = last_err.lower()
+        _soft_pats = [
+            "no such file or directory", "cannot access", "not found",
+            "no matches found", "0 directories, 0 files", "total 0",
+        ]
+        _is_soft = any(p in _err_lower or p in _out_lower for p in _soft_pats)
+        if _is_soft:
+            _lp(c("yellow", "  ⚠ Path not found or empty — reporting as-is."))
+            result["success"]    = True
+            result["stdout"]     = (last_err.strip() or result.get("stdout","").strip()
+                                    or "Directory not found or empty.")
+            result["returncode"] = 0
             return result
+
+        # Python exhausted all retries — stop here
+        if stype == "python":
+            _lp(c("red", f"  ✗ Step {step_id} — Python failed after {MAX_RETRIES} attempts."))
+            return result
+
+        _lp(c("red", "  ✗ Phase 1 exhausted — escalating..."))
+
+        # ── Phase 2: install missing tool ─────────────────────
+        clean    = self._strip_sudo(command)
+        bin_name = clean.split()[0].split("/")[-1] if clean.split() else ""
+        if bin_name and not shutil.which(bin_name):
+            _lp(c("yellow", f"  [Phase 2] '{bin_name}' not in PATH — installing..."))
+            ok, method, _ = self.analyzer.installer.install(bin_name)
+            if ok:
+                _lp(c("green", f"  [Phase 2] ✓ Installed via {method} — retrying..."))
+                result = self.cmd_exec.run(
+                    self._expand_tilde(clean, real_home),
+                    label=label, lock=lock, cwd=effective_cwd
+                )
+                self._log(task_id, step_id, tool, clean,
+                        result["stdout"], "success" if result["success"] else "error")
+                if result["success"]:
+                    return result
+                last_err = result["stderr"] or result["stdout"]
+
+        # ── Phase 3: alternative command ──────────────────────
+        alt_cmd = self.analyzer.suggest_alternative(command, desc or command, last_err)
+        if alt_cmd:
+            alt_bin = alt_cmd.strip().split()[0].split("/")[-1]
+            if alt_bin and not shutil.which(alt_bin):
+                _lp(c("dim", f"  [Phase 3] Installing alt tool: {alt_bin}"))
+                self.analyzer.installer.install(alt_bin)
+            alt_cmd = self._expand_tilde(alt_cmd, real_home)
+            _lp(c("cyan", f"  [Phase 3] Alternative: {alt_cmd[:80]}"))
+            result = self.cmd_exec.run(alt_cmd, label=label, lock=lock, cwd=effective_cwd)
+            self._log(task_id, step_id, tool, alt_cmd,
+                    result["stdout"], "success" if result["success"] else "error")
+            if result["success"]:
+                _lp(c("green", "  [Phase 3] ✓ Alternative succeeded"))
+                return result
+            last_err = result["stderr"] or result["stdout"]
+
+        # ── Phase 4: Python fallback ───────────────────────────
+        _lp(c("magenta", "  [Phase 4] Python fallback..."))
+        fb = PythonFallback(self.model, self.py_exec, self.cmd_exec)
+        result = fb.generate_and_run(command, desc or command, last_err, cwd=effective_cwd)
+        self._log(task_id, step_id, tool, f"[py-fallback]{command}",
+                result["stdout"], "success" if result["success"] else "fallback_failed")
+        if result["success"]:
+            return result
+
+        _lp(c("red", f"  ✗ Step {step_id} exhausted all recovery phases."))
+        return result
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 16 — SUMMARIZER
