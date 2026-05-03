@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# issue is some command not show output like cp mv other stuff in linux , in that case it shows error when the command successfull let the ai generate "NO-OUT" for those command so its not wait for the output
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║              HACKERS AI — Advanced Linux Agent               ║
@@ -2918,8 +2917,11 @@ class CLI:
             ) and not any(
                 kw in user_input.lower() for kw in
                 ["install","download","create","make","build","setup",
-                 "how","what","why","explain","describe","tell me"]
-            )
+                 "how","what","why","explain","describe","tell me",
+                "and give","and show","and print","and tell",
+                "server","service","daemon","host a","start a",
+                "setup a","run a","launch a",]
+            ) and len(user_input.split()) <= 6  # natural language is usually longer
 
             if _is_direct:
                 ex   = CommandExecutor()
