@@ -21,7 +21,6 @@ Supported endpoints:
 """
 
 import json
-import re
 import threading
 import time
 import uuid
@@ -30,7 +29,7 @@ from datetime import datetime
 from flask import Flask, request, Response, jsonify
 
 # ── reuse the scraper (must be in same folder) ────────────────
-from deepseek_scraper import DeepSeekScraper, extract_json_from_text
+from deepseek_scraper import DeepSeekScraper
 
 # ─────────────────────────────────────────────────────────────
 # Global scraper instance (one browser, one session)
@@ -38,7 +37,7 @@ from deepseek_scraper import DeepSeekScraper, extract_json_from_text
 
 _scraper: DeepSeekScraper | None = None
 _scraper_lock = threading.Lock()
-_headless_flag = False          # set before first use via CLI arg
+_headless_flag = False          # overridden by CLI arg before first use
 
 
 def get_scraper() -> DeepSeekScraper:
@@ -54,43 +53,50 @@ def get_scraper() -> DeepSeekScraper:
 # Message Formatting Helpers
 # ─────────────────────────────────────────────────────────────
 
+def _content_to_text(content) -> str:
+    """
+    Normalise the `content` field of a single message into a plain string.
+    Handles:
+      - str
+      - list of content blocks (text / tool_result / tool_use)
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_result":
+                inner = block.get("content", "")
+                if isinstance(inner, list):
+                    for rb in inner:
+                        if isinstance(rb, dict) and rb.get("type") == "text":
+                            parts.append(f"[Tool Result]\n{rb.get('text', '')}")
+                else:
+                    parts.append(f"[Tool Result]\n{inner}")
+            elif btype == "tool_use":
+                name = block.get("name", "tool")
+                inp  = json.dumps(block.get("input", {}), indent=2)
+                parts.append(f"[Tool Call: {name}]\n{inp}")
+        return "\n".join(parts)
+
+    return str(content)
+
+
 def _messages_to_prompt(messages: list) -> str:
     """
-    Flatten the Anthropic `messages` array into a single plain-text prompt.
-    Handles:
-      - Simple string content
-      - Content block arrays (text / image / tool_result / tool_use)
-      - System prompt injected at the top (passed separately)
+    Flatten an Anthropic `messages` array + optional system message into a
+    single plain-text prompt suitable for pasting into DeepSeek.
     """
     parts = []
     for msg in messages:
-        role    = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    btype = block.get("type", "")
-                    if btype == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif btype == "tool_result":
-                        result_content = block.get("content", "")
-                        if isinstance(result_content, list):
-                            for rb in result_content:
-                                if isinstance(rb, dict) and rb.get("type") == "text":
-                                    text_parts.append(f"[Tool Result]\n{rb.get('text', '')}")
-                        else:
-                            text_parts.append(f"[Tool Result]\n{result_content}")
-                    elif btype == "tool_use":
-                        name = block.get("name", "tool")
-                        inp  = json.dumps(block.get("input", {}), indent=2)
-                        text_parts.append(f"[Tool Call: {name}]\n{inp}")
-            text = "\n".join(text_parts)
-        else:
-            text = str(content)
+        role = msg.get("role", "user")
+        text = _content_to_text(msg.get("content", ""))
 
         if role == "system":
             parts.append(f"[System]\n{text}")
@@ -107,11 +113,14 @@ def _messages_to_prompt(messages: list) -> str:
 
 def _extract_prompt(body: dict) -> str:
     """
-    Build the prompt string to send to DeepSeek.
+    Build the final prompt string to send to DeepSeek.
 
-    Simple single-turn with no system prompt → send the last user
-    message directly (cleanest experience).
-    Everything else → flatten the full history into a structured prompt.
+    Strategy:
+      • Single user turn, no system prompt → send the raw user text directly.
+        This gives DeepSeek the cleanest possible input and avoids confusing
+        it with role-tagging boilerplate.
+      • Multi-turn or system prompt present → flatten the full history into a
+        structured Human:/Assistant: dialogue.
     """
     messages = body.get("messages", [])
     system   = body.get("system", "")
@@ -119,52 +128,13 @@ def _extract_prompt(body: dict) -> str:
     user_msgs = [m for m in messages if m.get("role") == "user"]
 
     if len(user_msgs) == 1 and not system:
-        # Single-turn: send bare user text
-        content = user_msgs[0].get("content", "")
-        if isinstance(content, list):
-            return " ".join(
-                b.get("text", "") for b in content
-                if isinstance(b, dict) and b.get("type") == "text"
-            )
-        return str(content)
+        return _content_to_text(user_msgs[0].get("content", ""))
 
-    # Multi-turn / system prompt: inject everything
     all_messages = []
     if system:
         all_messages.append({"role": "system", "content": system})
     all_messages.extend(messages)
     return _messages_to_prompt(all_messages)
-
-
-def _prompt_wants_json(prompt: str, body: dict) -> bool:
-    """
-    Heuristic: decide whether the caller expects a JSON response.
-    Checks:
-      - Explicit JSON format instruction in the prompt text
-      - response_format: { type: "json_object" }  (OpenAI-style, passed through)
-    """
-    if body.get("response_format", {}).get("type") == "json_object":
-        return True
-    lower = prompt.lower()
-    json_hints = [
-        "return json", "respond with json", "output json",
-        "in json format", "as json", "json only",
-        "return a json", "respond in json", "output a json",
-        "give me json", "provide json",
-    ]
-    return any(hint in lower for hint in json_hints)
-
-
-def _clean_response_text(md: str, reasoning_blocks: list) -> str:
-    """
-    Combine reasoning blocks + main response into the final text
-    the API caller will receive.
-    """
-    if reasoning_blocks:
-        think_header = "\n\n---\n*Reasoning:*\n"
-        think_body   = "\n\n---\n".join(reasoning_blocks)
-        return f"{think_header}{think_body}\n\n---\n\n{md}"
-    return md
 
 
 # ─────────────────────────────────────────────────────────────
@@ -174,13 +144,13 @@ def _clean_response_text(md: str, reasoning_blocks: list) -> str:
 def _build_response_body(content_text: str, model: str, usage_in: int = 0) -> dict:
     """Build a valid non-streaming Anthropic /v1/messages response."""
     return {
-        "id":      f"msg_{uuid.uuid4().hex[:24]}",
-        "type":    "message",
-        "role":    "assistant",
-        "content": [{"type": "text", "text": content_text}],
-        "model":   model,
-        "stop_reason":    "end_turn",
-        "stop_sequence":  None,
+        "id":            f"msg_{uuid.uuid4().hex[:24]}",
+        "type":          "message",
+        "role":          "assistant",
+        "content":       [{"type": "text", "text": content_text}],
+        "model":         model,
+        "stop_reason":   "end_turn",
+        "stop_sequence": None,
         "usage": {
             "input_tokens":  max(usage_in, 1),
             "output_tokens": max(len(content_text.split()), 1),
@@ -194,30 +164,33 @@ def _sse(data: dict) -> str:
 
 def _stream_response(content_text: str, model: str):
     """
-    Yield SSE events matching the Anthropic streaming wire format:
+    Yield SSE events that match the Anthropic streaming wire format:
       message_start → content_block_start → content_block_delta(s)
       → content_block_stop → message_delta → message_stop → [DONE]
     """
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    msg_id     = f"msg_{uuid.uuid4().hex[:24]}"
+    chunk_size = 40
 
     yield _sse({
         "type": "message_start",
         "message": {
-            "id":             msg_id,
-            "type":           "message",
-            "role":           "assistant",
-            "content":        [],
-            "model":          model,
-            "stop_reason":    None,
-            "stop_sequence":  None,
-            "usage":          {"input_tokens": 1, "output_tokens": 1},
+            "id":            msg_id,
+            "type":          "message",
+            "role":          "assistant",
+            "content":       [],
+            "model":         model,
+            "stop_reason":   None,
+            "stop_sequence": None,
+            "usage":         {"input_tokens": 1, "output_tokens": 1},
         },
     })
 
-    yield _sse({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "text", "text": ""}})
+    yield _sse({
+        "type":          "content_block_start",
+        "index":         0,
+        "content_block": {"type": "text", "text": ""},
+    })
 
-    chunk_size = 40
     for i in range(0, len(content_text), chunk_size):
         yield _sse({
             "type":  "content_block_delta",
@@ -243,24 +216,26 @@ def _stream_response(content_text: str, model: str):
 
 app = Flask(__name__)
 
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Headers": (
+        "Content-Type, Authorization, x-api-key, anthropic-version"
+    ),
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+}
+
 
 @app.after_request
 def _add_cors(response):
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type, Authorization, x-api-key, anthropic-version"
-    )
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    for k, v in _CORS_HEADERS.items():
+        response.headers[k] = v
     return response
 
 
 def _cors_preflight():
     resp = Response("", status=204)
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type, Authorization, x-api-key, anthropic-version"
-    )
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    for k, v in _CORS_HEADERS.items():
+        resp.headers[k] = v
     return resp
 
 
@@ -274,52 +249,48 @@ def messages():
     try:
         body = request.get_json(force=True) or {}
     except Exception:
-        return jsonify({"error": {"type": "invalid_request_error",
-                                  "message": "Invalid JSON body"}}), 400
+        return jsonify({"error": {
+            "type":    "invalid_request_error",
+            "message": "Invalid JSON body",
+        }}), 400
 
     model  = body.get("model", "deepseek-chat")
     stream = body.get("stream", False)
 
     if not body.get("messages"):
-        return jsonify({"error": {"type": "invalid_request_error",
-                                  "message": "messages required"}}), 400
+        return jsonify({"error": {
+            "type":    "invalid_request_error",
+            "message": "messages field is required",
+        }}), 400
 
-    prompt = _extract_prompt(body)
-    if not prompt.strip():
-        return jsonify({"error": {"type": "invalid_request_error",
-                                  "message": "Empty prompt"}}), 400
-
-    wants_json = _prompt_wants_json(prompt, body)
+    prompt = _extract_prompt(body).strip()
+    if not prompt:
+        return jsonify({"error": {
+            "type":    "invalid_request_error",
+            "message": "Prompt is empty after extraction",
+        }}), 400
 
     # ── Send to DeepSeek ──────────────────────────────────────
     try:
         scraper = get_scraper()
-
-        if wants_json:
-            # Use send_message_json: extracts clean JSON from raw DOM HTML,
-            # bypassing the markdown converter that corrupts JSON structure.
-            # We then re-serialize it so the response text is valid JSON.
-            try:
-                parsed = scraper.send_message_json(prompt, strict=True)
-                # Re-serialize cleanly — no markdown artifacts
-                full_text = json.dumps(parsed, ensure_ascii=False, indent=2)
-                reasoning_blocks = []
-            except ValueError:
-                # JSON extraction failed — fall back to plain markdown response
-                md, reasoning_blocks, elapsed = scraper.send_message(prompt)
-                full_text = _clean_response_text(md, reasoning_blocks)
-        else:
-            md, reasoning_blocks, elapsed = scraper.send_message(prompt)
-            full_text = _clean_response_text(md, reasoning_blocks)
-
+        md, reasoning_blocks, elapsed = scraper.send_message(prompt)
     except Exception as e:
-        return jsonify({"error": {"type": "api_error",
-                                  "message": f"DeepSeek scraper error: {e}"}}), 500
+        return jsonify({"error": {
+            "type":    "api_error",
+            "message": f"DeepSeek scraper error: {e}",
+        }}), 500
 
-    if full_text.startswith("[Error]"):
-        return jsonify({"error": {"type": "api_error", "message": full_text}}), 500
+    if md.startswith("[Error]"):
+        return jsonify({"error": {"type": "api_error", "message": md}}), 500
 
-    # ── Return response ───────────────────────────────────────
+    # Prepend reasoning as a Markdown section when present
+    if reasoning_blocks:
+        think_body = "\n\n---\n".join(reasoning_blocks)
+        full_text  = f"\n\n---\n*Reasoning:*\n{think_body}\n\n---\n\n{md}"
+    else:
+        full_text = md
+
+    # ── Stream or return ──────────────────────────────────────
     if stream:
         return Response(
             _stream_response(full_text, model),
@@ -331,37 +302,23 @@ def messages():
     return jsonify(_build_response_body(full_text, model, usage_in=input_tokens))
 
 
-# ── GET /v1/messages (graceful error for accidental GETs) ─────
-
-@app.route("/v1/messages", methods=["GET"])
-def messages_get():
-    return jsonify({
-        "error": {
-            "type":    "invalid_request_error",
-            "message": "POST /v1/messages — use POST, not GET.",
-        }
-    }), 405
-
-
 # ── GET /v1/models ────────────────────────────────────────────
 
 @app.route("/v1/models", methods=["GET", "OPTIONS"])
 def list_models():
     if request.method == "OPTIONS":
         return _cors_preflight()
+
+    now = 1720000000
     return jsonify({
         "data": [
-            {"id": "deepseek-chat",      "object": "model",
-             "created": 1720000000, "owned_by": "deepseek"},
-            {"id": "deepseek-reasoner",  "object": "model",
-             "created": 1720000000, "owned_by": "deepseek"},
-            # Aliases so tools that hard-code Claude model names still work
-            {"id": "claude-opus-4-6",    "object": "model",
-             "created": 1720000000, "owned_by": "anthropic"},
-            {"id": "claude-sonnet-4-6",  "object": "model",
-             "created": 1720000000, "owned_by": "anthropic"},
-            {"id": "claude-haiku-4-5",   "object": "model",
-             "created": 1720000000, "owned_by": "anthropic"},
+            # Native DeepSeek models
+            {"id": "deepseek-chat",     "object": "model", "created": now, "owned_by": "deepseek"},
+            {"id": "deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
+            # Anthropic aliases — so tools that hard-code Claude model names still work
+            {"id": "claude-opus-4-5",   "object": "model", "created": now, "owned_by": "anthropic"},
+            {"id": "claude-sonnet-4-5", "object": "model", "created": now, "owned_by": "anthropic"},
+            {"id": "claude-haiku-3-5",  "object": "model", "created": now, "owned_by": "anthropic"},
         ]
     })
 
@@ -371,11 +328,10 @@ def list_models():
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
-    scraper_status = "ready" if _scraper is not None else "not started"
     return jsonify({
         "status":  "ok",
         "proxy":   "chat.deepseek.com → Anthropic API",
-        "browser": scraper_status,
+        "browser": "ready" if _scraper is not None else "not started",
         "time":    datetime.now().isoformat(),
     })
 
@@ -387,34 +343,37 @@ def health():
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="chat.deepseek.com Anthropic API Proxy")
-    ap.add_argument("--host",      default="0.0.0.0",   help="Bind host (default: 0.0.0.0)")
-    ap.add_argument("--port",      default=8765, type=int, help="Port (default: 8765)")
-    ap.add_argument("--headless",  action="store_true",  help="Run browser headless")
+    ap = argparse.ArgumentParser(description="chat.deepseek.com → Anthropic API Proxy")
+    ap.add_argument("--host",      default="0.0.0.0",      help="Bind host (default: 0.0.0.0)")
+    ap.add_argument("--port",      default=8765, type=int,  help="Port (default: 8765)")
+    ap.add_argument("--headless",  action="store_true",     help="Run Chromium headless")
     ap.add_argument("--no-warmup", action="store_true",
-                    help="Don't pre-launch browser on startup (lazy init)")
+                    help="Lazy-init: don't pre-launch the browser on startup")
     args = ap.parse_args()
 
     _headless_flag = args.headless
 
-    print("\n" + "=" * 60)
-    print("   chat.deepseek.com  →  Anthropic API Proxy")
-    print("=" * 60)
-    print(f"  Listening on : http://{args.host}:{args.port}")
-    print(f"  Headless     : {args.headless}")
-    print()
-    print("  Set these in your shell, then run Claude Code:")
-    print(f'    export ANTHROPIC_BASE_URL="http://localhost:{args.port}"')
-    print(f'    export ANTHROPIC_API_KEY="local-proxy-key"')
-    print()
-    print("  Supported endpoints:")
-    print("    POST /v1/messages   (streaming + non-streaming)")
-    print("    GET  /v1/models")
-    print("    GET  /health")
-    print("=" * 60 + "\n")
+    banner = f"""
+{'=' * 60}
+   chat.deepseek.com  →  Anthropic API Proxy
+{'=' * 60}
+  Listening on : http://{args.host}:{args.port}
+  Headless     : {args.headless}
+
+  Configure your tool:
+    export ANTHROPIC_BASE_URL="http://localhost:{args.port}"
+    export ANTHROPIC_API_KEY="local-proxy-key"
+
+  Endpoints:
+    POST /v1/messages   (streaming + non-streaming)
+    GET  /v1/models
+    GET  /health
+{'=' * 60}
+"""
+    print(banner)
 
     if not args.no_warmup:
-        print("[*] Pre-launching browser (--no-warmup to skip) ...")
+        print("[*] Pre-launching browser (pass --no-warmup to skip) ...")
         get_scraper()
         print("[+] Browser ready. Proxy is live!\n")
 
