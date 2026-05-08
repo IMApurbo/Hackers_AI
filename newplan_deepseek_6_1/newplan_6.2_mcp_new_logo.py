@@ -104,7 +104,7 @@ BANNER = (
     f"\n"
     f"{COLORS['dim']}                           Author: @IMApurbo{COLORS['reset']}\n"
     f"\n"
-    f"{COLORS['cyan']}🔒 AI-Powered Pentesting & Bug Bounty Assistant{COLORS['reset']}\n"
+    f"{COLORS['cyan']} AI-Powered Pentesting & Bug Bounty Assistant{COLORS['reset']}\n"
 )
 # ══════════════════════════════════════════════════════════════
 # SECTION 1.5 — MCP CONFIG (Claude Desktop Style)
