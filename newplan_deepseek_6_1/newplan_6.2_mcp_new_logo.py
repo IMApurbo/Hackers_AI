@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════╗
-║              HACKERS AI — Advanced Linux Agent               ║
-║         General Purpose + Authorized Pentesting Suite        ║
-║                   Single-File Architecture v7.1              ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-
 import os
 import sys
 import ast
@@ -32,7 +24,7 @@ import urllib.error
 # DEEPSEEK PROXY CLIENT
 # ══════════════════════════════════════════════════════════════
 
-PROXY_BASE_URL = os.environ.get("HACKERS_AI_PROXY", "http://localhost:8765")
+PROXY_BASE_URL = os.environ.get("acurist_PROXY", "http://localhost:8765")
 PROXY_MODEL    = "deepseek-chat"
 
 class FreeLLM:
@@ -134,7 +126,7 @@ MCP_CONFIG_TEMPLATE = """{
 """
 
 def _mcp_config_load() -> dict:
-    """Load ~/.hackers_ai_mcp.json, return empty structure if missing/invalid."""
+    """Load ~/.acurist_mcp.json, return empty structure if missing/invalid."""
     if not os.path.exists(MCP_CONFIG_PATH):
         return {"mcpServers": {}}
     try:
@@ -358,7 +350,7 @@ class MemoryDB:
             notes = conn.execute(
                 "SELECT target,note,timestamp FROM target_notes ORDER BY id").fetchall()
         ts    = datetime.now().strftime("%Y-%m-%d %H:%M")
-        title = name or f"Hackers AI Session — {ts}"
+        title = name or f"ACURIST Session — {ts}"
         lines = [f"# {title}", f"*Exported: {ts}*", ""]
         if notes:
             lines += ["## Target Notes", ""]
@@ -950,7 +942,7 @@ class PythonExecutor:
 
         tmp_path = os.path.join(
             tempfile.gettempdir(),
-            f"hackers_ai_{os.getpid()}_{int(time.time() * 1000)}.py"
+            f"acurist_{os.getpid()}_{int(time.time() * 1000)}.py"
         )
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(code)
@@ -1170,7 +1162,7 @@ class MCPStdioClient:
     def initialize(self) -> dict:
         result = self._send("initialize", {
             "protocolVersion": "2024-11-05",
-            "clientInfo":      {"name": "hackers-ai", "version": VERSION},
+            "clientInfo":      {"name": "acurist", "version": VERSION},
             "capabilities":    {},
         }, timeout=15)
         self._notify("notifications/initialized")
@@ -1849,7 +1841,7 @@ PATH TRAVERSAL payloads to try via execute_command:
         )
 
         return textwrap.dedent(f"""
-You are Hackers AI — an autonomous Linux agent with full shell access.
+You are ACURIST — an autonomous Linux agent with full shell access.
 
 LIVE SYSTEM:
   Distro   : {profile.get('distro','Linux')}
@@ -2019,7 +2011,7 @@ class ResponseGenerator:
     def ask(self, user_input: str, history: list, profile: dict) -> str:
         tools_str = ", ".join(profile.get("available_tools", [])[:30])
         system_ctx = textwrap.dedent(f"""
-You are Hackers AI — a powerful Linux agent assistant.
+You are ACURIST — a powerful Linux agent assistant.
 
 SYSTEM:
   OS: {profile.get('distro','Linux')} | Kernel: {profile.get('kernel','')}
@@ -2582,7 +2574,7 @@ class Summarizer:
 
     def summarize(self, raw_results: str, original_request: str, history: list) -> str:
         system_ctx = textwrap.dedent(f"""
-You are Hackers AI. Write a SHORT, accurate summary of what just happened.
+You are ACURIST. Write a SHORT, accurate summary of what just happened.
 
 Rules:
 - Report ONLY what actually happened for THIS task
@@ -2913,9 +2905,9 @@ class CLI:
         "/delnotes":"Delete notes: /delnotes [target]",
         "/save":    "Save session report: /save [filename]",
         "/dryrun":  "Toggle dry-run mode (preview commands only)",
-        "/config":  "Open MCP config file in editor (~/.hackers_ai_mcp.json)",
+        "/config":  "Open MCP config file in editor (~/.acurist_mcp.json)",
         "/mcp":     "MCP: /mcp list|use <name>|exit|reload|tools [name]|call <tool> [args]|ai <task>",
-        "/exit":    "Exit Hackers AI",
+        "/exit":    "Exit ACURIST",
     }
 
     def __init__(self):
@@ -2991,7 +2983,7 @@ class CLI:
         except Exception:
             print(c("yellow", f"\n  [!] WARNING: Proxy not reachable at {PROXY_BASE_URL}"))
             print(c("yellow",  "  [!] Start it first:  python server.py [--headless]"))
-            print(c("yellow",  "  [!] Or set env var:  export HACKERS_AI_PROXY=http://host:port\n"))
+            print(c("yellow",  "  [!] Or set env var:  export acurist_PROXY=http://host:port\n"))
 
     def _get_prompt(self) -> str:
         try:
@@ -3052,7 +3044,7 @@ class CLI:
 
         if slug == "/help":
             print()
-            print(c("yellow", "  ╔══ HACKERS AI COMMANDS " + "═"*39))
+            print(c("yellow", "  ╔══ ACURIST COMMANDS " + "═"*39))
             cats = [
                 ("General",  ["/help","/clear","/history","/profile","/tools","/sysinfo","/switch","/exit"]),
                 ("Session",  ["/target","/auth","/shell","/save","/dryrun"]),
@@ -3182,7 +3174,7 @@ class CLI:
 
         if slug == "/shell":
             print(c("cyan", f"\n  Dropping to bash in {self.cwd}"))
-            print(c("dim", "  Type 'exit' to return to Hackers AI\n"))
+            print(c("dim", "  Type 'exit' to return to ACURIST\n"))
             sudo_user = os.environ.get("SUDO_USER")
             if sudo_user and self.run_as_user:
                 env = os.environ.copy()
@@ -3190,7 +3182,7 @@ class CLI:
                 subprocess.run(["su", "-s", "/bin/bash", sudo_user], cwd=self.cwd, env=env)
             else:
                 subprocess.run(["/bin/bash"], cwd=self.cwd)
-            print(c("cyan", "\n  Returned to Hackers AI\n"))
+            print(c("cyan", "\n  Returned to ACURIST\n"))
             return True
 
         if slug in ("/recon", "recon"):
@@ -3265,7 +3257,7 @@ class CLI:
         return False
 
     # ══════════════════════════════════════════════════════
-    # /config  — open ~/.hackers_ai_mcp.json in editor
+    # /config  — open ~/.acurist_mcp.json in editor
     # ══════════════════════════════════════════════════════
     def _cmd_config(self):
         _mcp_config_ensure()
@@ -3323,7 +3315,7 @@ class CLI:
                 print()
                 return True
             print()
-            print(c("cyan", "  ╔══ MCP SERVERS (from ~/.hackers_ai_mcp.json) " + "═"*18))
+            print(c("cyan", "  ╔══ MCP SERVERS (from ~/.acurist_mcp.json) " + "═"*18))
             for name, scfg in servers.items():
                 act     = c("green", " ● ACTIVE") if name == active else c("dim", " ○")
                 cmd_str = scfg.get("command", "?")
@@ -3593,7 +3585,7 @@ Output ONLY JSON lines. No explanation, no markdown.
         print(c("red", f"  Unknown /mcp subcommand: '{sub_cmd}'"))
         print(c("dim", "  Commands: list | use <name> | stop | reload"))
         print(c("dim", "            tools [name] | call <tool> [args] | ai <task>"))
-        print(c("dim", "  Config  : /config  (edit ~/.hackers_ai_mcp.json)"))
+        print(c("dim", "  Config  : /config  (edit ~/.acurist_mcp.json)"))
         return True
 
     def _confirm_scope(self, host: str) -> bool:
@@ -3653,7 +3645,7 @@ Output ONLY JSON lines. No explanation, no markdown.
 
     def _print_response(self, text: str):
         print()
-        print(c("green", "  ╭─ Hackers AI ") + c("dim", "─"*49))
+        print(c("green", "  ╭─ ACURIST ") + c("dim", "─"*49))
         for line in text.splitlines():
             print(c("dim", "  │ ") + line)
         print(c("green", "  ╰" + "─"*62))
@@ -3981,7 +3973,7 @@ Output ONLY JSON lines. No explanation, no markdown.
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
-        print("\033[33m  [*] Hackers AI requires root. Re-launching with sudo...\033[0m")
+        print("\033[33m  [*] ACURIST requires root. Re-launching with sudo...\033[0m")
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
         sys.exit(1)
 
