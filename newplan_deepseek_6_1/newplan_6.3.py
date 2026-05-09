@@ -359,13 +359,13 @@ class TelegramBot:
             or any(t in joined for t in FLUSH_TRIGGERS)
         )
         if not should_flush:
-            return buf   # keep accumulating
+            return list(buf)   # return a COPY — not the same list reference
 
         if joined:
             if len(joined) > 3800:
                 joined = joined[:3800] + "\n...[truncated]"
             self.send(f"<pre>{joined}</pre>")
-        return []
+        return []  # always return a new empty list, never the original buf
 
     def _dispatch(self, text: str):
         """
@@ -1190,10 +1190,16 @@ class CommandExecutor:
         _print = (lambda msg: _locked_print(lock, msg)) if lock else print
         effective_cwd = cwd if (cwd and os.path.isdir(cwd)) else None
 
-        _print(c("dim", f"\n  ┌─ {tag}$ {command}"))
         stdout_lines = []
         start        = time.time()
         process      = None
+
+        # In Telegram tee mode stdout.isatty() returns False — collect all output
+        # silently and emit the whole block as one print() → one Telegram message.
+        _tg_mode = not getattr(sys.stdout, 'isatty', lambda: True)()
+
+        if not _tg_mode:
+            _print(c("dim", f"\n  ┌─ {tag}$ {command}"))
 
         def _kill():
             if process and process.poll() is None:
@@ -1217,13 +1223,23 @@ class CommandExecutor:
                 for line in iter(process.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
-                        _print(c("dim", f"  │ {tag}") + line)
+                        if not _tg_mode:
+                            _print(c("dim", f"  │ {tag}") + line)
                         stdout_lines.append(line)
             except KeyboardInterrupt:
-                _print(c("yellow", f"\n  ├─ {tag}⚡ Ctrl+C — cancelling..."))
+                if not _tg_mode:
+                    _print(c("yellow", f"\n  ├─ {tag}⚡ Ctrl+C — cancelling..."))
                 _kill()
                 elapsed = round(time.time() - start, 2)
-                _print(c("yellow", f"  └─ {tag}✗ Cancelled ({elapsed}s)"))
+                if _tg_mode:
+                    block = (
+                        f"  ┌─ {tag}$ {command}\n"
+                        + ("\n".join(f"  │ {l}" for l in stdout_lines) + "\n" if stdout_lines else "")
+                        + f"  └─ ✗ Cancelled ({elapsed}s)"
+                    )
+                    _print(block)
+                else:
+                    _print(c("yellow", f"  └─ {tag}✗ Cancelled ({elapsed}s)"))
                 return {
                     "command": command, "stdout": "\n".join(stdout_lines),
                     "stderr": "Cancelled by user", "returncode": -2,
@@ -1237,8 +1253,22 @@ class CommandExecutor:
 
             elapsed = round(time.time() - start, 2)
             success = process.returncode == 0
-            icon    = c("green", "✓") if success else c("red", "✗")
-            _print(c("dim", f"  └─ {tag}{icon} exit:{process.returncode} ({elapsed}s)"))
+
+            if _tg_mode:
+                # Emit the entire command block as ONE print — one Telegram message
+                icon_str = "✓" if success else "✗"
+                all_lines = stdout_lines[:]
+                if not success and stderr_lines:
+                    all_lines += [f"[stderr] {l}" for l in stderr_lines if l]
+                block = (
+                    f"  ┌─ {tag}$ {command}\n"
+                    + ("\n".join(f"  │ {l}" for l in all_lines) + "\n" if all_lines else "")
+                    + f"  └─ {icon_str} exit:{process.returncode} ({elapsed}s)"
+                )
+                _print(block)
+            else:
+                icon = c("green", "✓") if success else c("red", "✗")
+                _print(c("dim", f"  └─ {tag}{icon} exit:{process.returncode} ({elapsed}s)"))
             return {
                 "command":    command,
                 "stdout":     "\n".join(stdout_lines),
@@ -1250,7 +1280,15 @@ class CommandExecutor:
             }
         except subprocess.TimeoutExpired:
             _kill()
-            _print(c("red", f"  └─ {tag}✗ Timeout!"))
+            if _tg_mode:
+                block = (
+                    f"  ┌─ {tag}$ {command}\n"
+                    + ("\n".join(f"  │ {l}" for l in stdout_lines) + "\n" if stdout_lines else "")
+                    + f"  └─ ✗ Timeout ({timeout}s)"
+                )
+                _print(block)
+            else:
+                _print(c("red", f"  └─ {tag}✗ Timeout!"))
             return {"command": command, "stdout": "\n".join(stdout_lines),
                     "stderr": "Timeout", "returncode": -1,
                     "success": False, "elapsed": timeout, "cancelled": False}
@@ -4503,7 +4541,12 @@ Output ONLY JSON lines. No explanation, no markdown.
         # In Telegram mode the stdout tee will forward the text directly —
         # skip the box-drawing chrome which renders poorly in Telegram.
         if getattr(self, "_tg_mode", False):
-            print(text)
+            # Send summary directly via bot API to guarantee delivery,
+            # bypassing the tee buffer which may not flush single-line output.
+            if self._tg and self._tg.enabled:
+                self._tg.send(f"<b>📋 Summary:</b>\n<pre>{text[:3000]}</pre>")
+            else:
+                print(text)
             return
         print()
         print(c("green", "  ╭─ Hackers AI ") + c("dim", "─"*49))
@@ -4687,8 +4730,9 @@ Output ONLY JSON lines. No explanation, no markdown.
         self.memory.add_message("assistant", summary,    self.model)
 
         # Telegram task-done notification (tasks only — informational handled above)
-        _elapsed = _task_end - _task_start if "_task_start" in dir() else 0
-        self._tg.notify_task_done(user_input, summary, _elapsed)
+        _elapsed = _task_end - _task_start if "_task_start" in locals() else 0
+        if not getattr(self, "_tg_mode", False):
+            self._tg.notify_task_done(user_input, summary, _elapsed)
 
         # _suggest_next is terminal-only — skip in Telegram mode
         if not getattr(self, "_tg_mode", False) and len(enriched.split()) > 3:
