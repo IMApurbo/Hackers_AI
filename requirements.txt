@@ -1,0 +1,18 @@
+# Hackers AI — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Web automation ─────────────────────────────────────────────
+playwright>=1.40.0
+
+# ── Terminal UI ────────────────────────────────────────────────
+rich>=13.0.0
+
+# ── HTML to text conversion (optional but preferred) ──────────
+html2text>=2020.1.16
+
+# ── Web server (deepseek_server.py) ───────────────────────────
+flask>=3.0.0
+
+# ── Standard library modules (no install needed) ──────────────
+# time, json, re, sys, pathlib, html.parser,
+# threading, uuid, datetime — all built into Python 3.8+
