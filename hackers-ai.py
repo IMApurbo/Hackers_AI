@@ -2704,7 +2704,7 @@ class ResponseGenerator:
     def ask(self, user_input: str, history: list, profile: dict) -> str:
         tools_str = ", ".join(profile.get("available_tools", [])[:30])
         system_ctx = textwrap.dedent(f"""
-You are Hackers AI — a powerful Linux agent assistant.
+You are Hackers AI — a powerful Linux agent assistant. Devloped by @IMApurbo(AKM Korishee Apurbo)
 
 SYSTEM:
   OS: {profile.get('distro','Linux')} | Kernel: {profile.get('kernel','')}
