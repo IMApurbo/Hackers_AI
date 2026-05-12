@@ -2958,39 +2958,77 @@ class ExecutionEngine:
             def _is_validation_err(txt):
                 return ("validation error" in txt.lower() or
                         "field required" in txt.lower() or
-                        "missing" in txt.lower() and "input_value" in txt.lower())
+                        "'query' is a required" in txt.lower() or
+                        "is a required property" in txt.lower() or
+                        ("missing" in txt.lower() and "input_value" in txt.lower()))
+
+            # ── helper: strip args to only schema-valid keys ────────
+            # This is the PRIMARY fix: before calling any tool, drop every key
+            # that is not declared in the tool's inputSchema.  The LLM planner
+            # sometimes stuffs planning metadata (intent, summary, requires_root …)
+            # into the args dict instead of real tool parameters.
+            def _strip_to_schema(t_name, raw_args):
+                schema = _tool_schema(t_name)
+                props  = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                if not props:
+                    # No schema info available — pass args through unchanged
+                    return raw_args
+                valid_keys = set(props.keys())
+                stripped   = {k: v for k, v in raw_args.items() if k in valid_keys}
+                dropped    = set(raw_args.keys()) - valid_keys
+                if dropped:
+                    _lp(c("yellow", f"  [MCP] ⚠ dropped unknown arg keys for {t_name}: {sorted(dropped)}"))
+                return stripped
 
             # ── helper: fix args via LLM using real schema ─────────
             def _fix_args(t_name, bad_args, err_txt):
                 schema = _tool_schema(t_name)
                 props  = schema.get("properties", {}) if isinstance(schema, dict) else {}
                 req    = schema.get("required", []) if isinstance(schema, dict) else []
+                if not props:
+                    return None  # Nothing to fix without a schema
+                # Strip planning-context keys from bad_args before showing the LLM
+                valid_keys = set(props.keys())
+                clean_bad  = {k: v for k, v in bad_args.items() if k in valid_keys}
                 # Build param hint: name*(type): description
-                hints  = []
+                hints = []
                 for pn, pi in (props.items() if isinstance(props, dict) else []):
                     star = "*" if pn in req else ""
-                    pt   = pi.get("type","any") if isinstance(pi, dict) else "any"
-                    pd   = pi.get("description","") if isinstance(pi, dict) else ""
+                    pt   = pi.get("type", "any") if isinstance(pi, dict) else "any"
+                    pd   = pi.get("description", "") if isinstance(pi, dict) else ""
                     hints.append(f"  {pn}{star}({pt}): {pd[:60]}")
                 schema_hint = "\n".join(hints) if hints else "(no schema available)"
+                # Tell the LLM what valid values already exist so it can carry them over
                 prompt = (
-                    f"MCP tool call failed with a validation/argument error.\n"
-                    f"Tool   : {t_name}\n"
-                    f"BadArgs: {json.dumps(bad_args)}\n"
-                    f"Error  : {err_txt[:400]}\n\n"
-                    f"REAL PARAMETER SCHEMA for {t_name}:\n{schema_hint}\n\n"
-                    f"Return ONLY a JSON object with the corrected arguments using the EXACT "
-                    f"parameter names shown above. Nothing else — just the JSON object."
+                    f"MCP tool call failed — the args dict had wrong/missing keys.\n"
+                    f"Tool        : {t_name}\n"
+                    f"Valid args so far: {json.dumps(clean_bad)}\n"
+                    f"Error       : {err_txt[:400]}\n\n"
+                    f"EXACT PARAMETER SCHEMA for {t_name}:\n{schema_hint}\n\n"
+                    f"Required params marked with *. Infer sensible values for any missing "
+                    f"required params from the tool name and valid args above.\n"
+                    f"Return ONLY a JSON object with ALL required parameters using the EXACT "
+                    f"parameter names listed above. Nothing else — just the JSON object."
                 )
                 try:
                     agent   = FreeLLM(model=self.model)
                     raw_fix = agent.ask(prompt).strip()
                     fixed   = extract_json(raw_fix)
                     if isinstance(fixed, dict):
-                        return fixed
+                        # Always restrict the result to valid schema keys
+                        fixed = {k: v for k, v in fixed.items() if k in valid_keys}
+                        # Ensure all required keys are present
+                        if all(r in fixed for r in req):
+                            return fixed
+                        _lp(c("yellow", f"  [MCP] ⚠ LLM fix missing required keys: "
+                              f"{[r for r in req if r not in fixed]}"))
+                        return fixed if fixed else None
                 except Exception:
                     pass
                 return None
+
+            # ── pre-validate: strip args to schema before first call ─
+            mcp_args = _strip_to_schema(mcp_tool, mcp_args)
 
             # ── attempt 1 ─────────────────────────────────────────
             start = time.time()
@@ -3009,7 +3047,9 @@ class ExecutionEngine:
             if is_err and _is_validation_err(text_out):
                 _lp(c("yellow", f"  [MCP] ⚠ arg mismatch — fixing schema for {mcp_tool}..."))
                 fixed_args = _fix_args(mcp_tool, mcp_args, text_out)
-                if fixed_args and fixed_args != mcp_args:
+                # Retry whenever _fix_args returns a non-None dict — even if the
+                # keys look the same as mcp_args, the values may have been corrected.
+                if fixed_args is not None and isinstance(fixed_args, dict):
                     _lp(c("dim",    f"  [MCP] corrected args: {json.dumps(fixed_args)[:120]}"))
                     try:
                         raw_result, text_out, elapsed, is_err = _mcp_attempt(mcp_tool, fixed_args)
@@ -3019,7 +3059,7 @@ class ExecutionEngine:
                         text_out = str(e2)
                         is_err   = True
                 else:
-                    _lp(c("red", "  [MCP] could not determine corrected args"))
+                    _lp(c("red", "  [MCP] could not determine corrected args — check tool schema"))
 
             # ── final result ───────────────────────────────────────
             elapsed = round(time.time() - start, 2)
