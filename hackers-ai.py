@@ -498,7 +498,6 @@ class TelegramBot:
             try:
                 self._cli._inject_profile_context()
                 if text.startswith("/"):
-                    slug = text.strip().split()[0].lower()
                     self._cli._handle_slash(text)
                 else:
                     self._cli.process(text)
@@ -617,6 +616,7 @@ BANNER = r"""
   ██║  ██║██║  ██║╚██████╗██║  ██╗███████╗██║  ██║███████║    ██║  ██║██║
   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝    ╚═╝  ╚═╝╚═╝
          Advanced Linux Agent · General Purpose + Authorized Pentesting
+                              Author: IMApurbo
 """
 
 COLORS = {
@@ -628,6 +628,14 @@ COLORS = {
 
 def c(color: str, text: str) -> str:
     return f"{COLORS.get(color,'')}{text}{COLORS['reset']}"
+
+def _rl_wrap(ansi_str: str) -> str:
+    """Wrap every ANSI escape sequence in readline non-printing markers \\001...\\002.
+    This prevents readline from counting invisible escape bytes as visible characters,
+    which otherwise causes cursor miscalculation and terminal corruption when typing
+    long input (especially with MCP prefix in the prompt).
+    """
+    return re.sub(r'(\033\[[0-9;]*m)', r'\001\1\002', ansi_str)
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 1.5 — MCP CONFIG (Claude Desktop Style)
@@ -673,7 +681,8 @@ def _mcp_config_ensure():
             f.write(MCP_CONFIG_TEMPLATE)
 
 def _mcp_config_open_editor():
-    """Open MCP config in the user's preferred editor."""
+    """Open MCP config in the user's preferred editor, always via sudo so the
+    root-owned config file (~/.hackers_ai_mcp.json) can be written."""
     _mcp_config_ensure()
     # Pick editor: $VISUAL > $EDITOR > nano > vi
     editor = (
@@ -683,21 +692,16 @@ def _mcp_config_open_editor():
         or shutil.which("vi")
         or "nano"
     )
-    # If running as root via sudo, open as the real user so the GUI editor works
-    sudo_user = os.environ.get("SUDO_USER")
     try:
-        if sudo_user and os.geteuid() == 0:
-            env = os.environ.copy()
-            env["HOME"] = os.path.expanduser(f"~{sudo_user}")
-            subprocess.run(
-                ["su", "-c", f"{shlex.quote(editor)} {shlex.quote(MCP_CONFIG_PATH)}", sudo_user],
-                env=env
-            )
-        else:
+        if os.geteuid() == 0:
+            # Already root — open directly (no sudo wrapper needed)
             subprocess.run([editor, MCP_CONFIG_PATH])
+        else:
+            # Not root — use sudo so the editor can write to the root-owned file
+            subprocess.run(["sudo", editor, MCP_CONFIG_PATH])
     except Exception as e:
         print(c("red", f"  Could not open editor: {e}"))
-        print(c("dim",  f"  Edit manually: {MCP_CONFIG_PATH}"))
+        print(c("dim", f"  Edit manually: sudo {editor} {MCP_CONFIG_PATH}"))
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 2 — DATABASE  (MCP tables simplified — no URL storage)
@@ -2063,9 +2067,21 @@ ALWAYS ready=true for:
   - local system tasks (disk, cpu, memory, processes, files, services)
   - tasks whose input already contains an IP / domain / URL / port number
   - follow-up tasks clearly connected to recent history (even if terse)
+  - ANY task when an MCP server is active — the agent will use MCP tools
+    to discover the needed context (e.g. list files, read config, query resources)
+    rather than bother the user with a question
+
+MCP CONTEXT RULE (CRITICAL — highest priority):
+  When an MCP server is connected, ALWAYS set ready=true, regardless of
+  missing context. The agent will use the MCP server's tools to discover
+  what it needs (directory listings, resource reads, environment queries, etc.).
+  NEVER set ready=false when MCP is active — instead build the best possible
+  enriched_task and let the planner use MCP tools to fill any gaps.
 
 ready=false ONLY when:
+  - NO MCP server is active
   - task obviously needs a remote target AND none exists anywhere in history
+  - user has already been asked once and still hasn't provided the info
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT — respond ONLY with:
@@ -2074,12 +2090,12 @@ OUTPUT — respond ONLY with:
 {
   "intent": "task",
   "ready": true,
-  "found_in": "task|history|local|fallback",
+  "found_in": "task|history|local|mcp|fallback",
   "enriched_task": "<complete task string with all values filled in>",
   "question": null
 }
 ```
-OR when more info is genuinely needed:
+OR when more info is genuinely needed (NO MCP active only):
 ```json
 {
   "intent": "task",
@@ -2114,10 +2130,12 @@ OR for pure knowledge questions:
         re.IGNORECASE
     )
 
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL, mcp_active: bool = False):
         self.model           = model
         self._question_count = 0
-        self._max_questions  = 2
+        # When MCP is active, never ask the user — use tools to discover context instead
+        self._max_questions  = 0 if mcp_active else 2
+        self._mcp_active     = mcp_active
 
     def analyze(self, user_input: str, history: list) -> dict:
         """
@@ -2158,12 +2176,22 @@ OR for pure knowledge questions:
             raw    = agent.ask(prompt)
             result = extract_json(raw)
             if result and "intent" in result and "ready" in result:
-                if not result.get("ready"):
-                    self._question_count += 1
-                else:
-                    self._question_count = 0
+                # When MCP is active: never ask the user — always proceed and let
+                # the planner use MCP tools to discover missing context.
+                if self._mcp_active:
+                    result["ready"] = True
+                    result["question"] = None
                     if not result.get("enriched_task"):
                         result["enriched_task"] = user_input
+                    if result.get("found_in") in (None, "none"):
+                        result["found_in"] = "mcp"
+                else:
+                    if not result.get("ready"):
+                        self._question_count += 1
+                    else:
+                        self._question_count = 0
+                        if not result.get("enriched_task"):
+                            result["enriched_task"] = user_input
                 return result
         except Exception:
             pass
@@ -2213,6 +2241,7 @@ class PlannerEngine:
             "IMPORTANT: ALL steps MUST be type=mcp_call. "
             "Use ONLY tool names from MCP TOOL CATALOGUE. "
             "Match EXACT parameter names from the schema. "
+            "If context is missing, add a discovery step using an MCP tool — never ask the user. "
         ) if profile.get("active_mcp_tools") else ""
         prompt = (
             system_ctx + "\n\n"
@@ -2412,6 +2441,13 @@ MCP RULES:
   4. Chain steps with depends_on when a step needs a prior step's output.
   5. For web testing: use nikto_scan, gobuster_scan, sqlmap_scan etc. directly.
      For custom curl/ffuf/wfuzz → use execute_command.
+  6. NEVER ask the user for more information. If context is missing (target IP, filename,
+     path, config value, etc.), add a discovery step FIRST — use an MCP tool to find it:
+       • list files/directories → use the appropriate list/read tool
+       • unknown target → use a tool to enumerate hosts or read a config
+       • unknown parameter → use a tool to inspect the environment or resources
+     Chain that discovery step (depends_on=[]) ahead of the steps that need its output.
+  7. Prefer acting and discovering over asking. The user wants results, not questions.
 """).strip()
         else:
             mcp_block = ""
@@ -2589,6 +2625,8 @@ warning: null or string (not the string "null")
                 "IMPORTANT: ALL steps MUST be type=mcp_call. "
                 "Use ONLY tool names from the MCP TOOL CATALOGUE above. "
                 "Put actual arg values in the args dict — match EXACT parameter names. "
+                "If any context is missing (target, path, ID, etc.), add a discovery "
+                "step first using an MCP tool — do NOT ask the user for information. "
                 "RESPOND WITH ONLY A ```json ... ``` FENCED BLOCK — NOTHING ELSE."
             )
         else:
@@ -3756,29 +3794,39 @@ class CLI:
             _sudo_user = "root"
             _hostname  = "kali"
 
-        target_str = ""
+        # Build inline badge prefix — shown on the SAME line as the shell prompt.
+        # These are short tags so they don't cause readline line-wrap issues.
+        badge_parts = []
         if self.sticky_target:
-            target_str = c("dim", f"[{self.sticky_target}]") + "\n"
-
-        mcp_str = ""
+            badge_parts.append(c("dim", f"[{self.sticky_target}]"))
         if self._mcp_client:
-            mcp_str = c("dim", f"[mcp:{self._mcp_client.name}] ")
+            badge_parts.append(c("cyan", f"[mcp:{self._mcp_client.name}]"))
+        if self._tg.enabled and self._tg._thread and self._tg._thread.is_alive():
+            badge_parts.append(c("dim", "[tg:on]"))
 
+        badge_str = (" ".join(badge_parts) + " ") if badge_parts else ""
+
+        # Full single-line prompt: badges + shell prompt — no embedded newlines.
+        # Every ANSI sequence is wrapped in readline non-printing markers so
+        # readline counts only the visible characters for cursor positioning.
         user_col = "red" if not self.run_as_user else "green"
-        return (
-            target_str +
-            mcp_str +
+        prompt = (
+            badge_str +
             c("dim", "(") + c(user_col, _sudo_user) +
             c("dim", "㉿") + c("cyan", _hostname) +
             c("dim", ")-[") + c("yellow", display) +
             c("dim", "]") + c("white", "$ ")
         )
+        if _READLINE_OK:
+            return _rl_wrap(prompt)
+        return prompt
 
     def _print_banner(self):
         print(c("green", BANNER))
         root_str = c("red", "● ROOT") if self.profile["root"] else c("yellow", "● USER")
         n_tools  = len(self.profile["available_tools"])
-        print(c("dim", f"  Model    : {self.model}  |  Agent v{VERSION}"))
+        print(c("dim", f"  Author   : IMApurbo  |  Agent v{VERSION}"))
+        print(c("dim", f"  Model    : {self.model}"))
         print(c("dim", f"  Backend  : {PROXY_BASE_URL}"))
         print(c("dim", f"  OS       : {self.profile.get('distro','Linux')}  |  "
                         f"Kernel {self.profile.get('kernel','')}  |  {self.profile.get('arch','')}"))
@@ -4013,13 +4061,42 @@ class CLI:
 
         if slug == "/exit":
             print(c("cyan", "\n  Goodbye.\n"))
-            if self._tg.enabled:
-                self._tg.stop(reason="⌨️ Operator typed /exit")
-            else:
-                self._tg.stop()
+            self._shutdown()
             sys.exit(0)
 
         return False
+
+    def _shutdown(self, reason: str = ""):
+        """Close every active connection cleanly: MCP server + Telegram bot."""
+        # 1. Stop MCP subprocess and clear the DB record so _restore_mcp()
+        #    does NOT reconnect it on the next startup.
+        if self._mcp_client:
+            try:
+                name = self._mcp_client.name
+                self._mcp_client._stop()
+                print(c("dim", f"  [✓] MCP '{name}' disconnected"))
+            except Exception:
+                pass
+            self._mcp_client = None
+        # Always clear the persisted active-server record on any clean exit.
+        try:
+            self.memory.clear_mcp_active()
+        except Exception:
+            pass
+
+        # 2. Stop Telegram bridge
+        if self._tg.enabled or (self._tg._thread and self._tg._thread.is_alive()):
+            try:
+                self._tg.stop(reason=reason) if reason else self._tg.stop()
+                print(c("dim", "  [✓] Telegram bridge stopped"))
+            except Exception:
+                pass
+        else:
+            # Always call stop() to clean up the thread even if not "enabled"
+            try:
+                self._tg.stop()
+            except Exception:
+                pass
 
     # ══════════════════════════════════════════════════════
     # /config  — open ~/.hackers_ai_mcp.json in editor
@@ -4755,7 +4832,7 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         # ── Single unified analysis: intent + context + history in one JSON call ──
         print(c("dim", "\n  [→] Analysing..."))
-        analyzer = QueryAnalyzer(model=self.model)
+        analyzer = QueryAnalyzer(model=self.model, mcp_active=bool(self._mcp_client))
         analysis = analyzer.analyze(enriched_input, history)
 
         intent   = analysis.get("intent", "task")
@@ -4907,10 +4984,7 @@ Output ONLY JSON lines. No explanation, no markdown.
                 user_input = input(self._get_prompt()).strip()
             except (EOFError, KeyboardInterrupt):
                 print(c("cyan", "\n\n  Goodbye.\n"))
-                if self._tg.enabled:
-                    self._tg.stop(reason="⌨️ Session ended (Ctrl+C / EOF)")
-                else:
-                    self._tg.stop()
+                self._shutdown(reason="⌨️ Session ended (Ctrl+C / EOF)")
                 break
 
             if not user_input:
