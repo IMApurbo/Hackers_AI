@@ -55,6 +55,287 @@ except ImportError:
     _READLINE_OK = False
 
 # ══════════════════════════════════════════════════════════════
+# SECTION 0.5 — USER PROFILE (--improve / -i)
+# ══════════════════════════════════════════════════════════════
+#
+# Stores a compact, deduplicated, ever-growing portrait of the user.
+# Each line is a single fact / preference / observed behaviour.
+# On every session close and on /improve the AI scans session history,
+# extracts new user facts, skips any already captured, appends the rest,
+# and displays the full updated profile automatically.
+#
+# File: ~/.hackers_ai_profile.txt   (one fact per line, UTF-8)
+# ──────────────────────────────────────────────────────────────
+
+IMPROVE_PROFILE_PATH = os.path.expanduser("~/.hackers_ai_profile.txt")
+
+class UserProfileImprover:
+    """
+    Reads ~/.hackers_ai_profile.txt, derives new user-facts from the
+    current session, deduplicates semantically, and appends only lines
+    whose meaning is not already present.
+
+    Each stored line is a short (≤ 120 char) factual statement, e.g.:
+      • User prefers to communicate in Bangla.
+      • User uses Ghidra for reverse engineering.
+
+    /improve — auto-updates from session history and prints the profile.
+    No manual sub-commands needed.
+    """
+
+    SEED_FACTS = [
+        "User prefers to communicate in Bangla.",
+        "User uses Ghidra for reverse engineering and CTF challenges.",
+    ]
+
+    def __init__(self, model: str):
+        self.model = model
+
+    # ── I/O ────────────────────────────────────────────────────
+    def _load(self) -> list:
+        if not os.path.exists(IMPROVE_PROFILE_PATH):
+            return []
+        with open(IMPROVE_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return [ln.rstrip() for ln in f if ln.strip()]
+
+    def _save(self, lines: list):
+        with open(IMPROVE_PROFILE_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        # Restrict to owner-only (profile may contain sensitive prefs)
+        try:
+            os.chmod(IMPROVE_PROFILE_PATH, 0o600)
+        except Exception:
+            pass
+
+    # ── Core logic ─────────────────────────────────────────────
+    def _existing_block(self, lines: list) -> str:
+        return "\n".join(f"  {i+1}. {l}" for i, l in enumerate(lines)) if lines else "  (none yet)"
+
+    def _derive_new_facts(self, history_text: str, existing: list) -> list:
+        """Ask the LLM to extract new, non-duplicate facts from the session.
+        MERGE-FIRST policy: always try to merge new info into an existing line.
+        Only add a brand-new line if the topic is completely absent.
+        Goal: keep the profile as short and dense as possible."""
+        existing_block = self._existing_block(existing)
+        prompt = (
+            "You are a user-modelling assistant for an AI agent.\n"
+            "The conversation history has two roles: 'user' (the human) and 'assistant' (the AI).\n"
+            "Your job: extract NEW facts about the USER (the human) from this history.\n\n"
+            "IDENTITY RULES:\n"
+            "- 'user' role lines = what the human said\n"
+            "- 'assistant' role lines = what the AI said — IGNORE for user facts\n"
+            "- If the user states their own name, record it as a fact about the user\n"
+            "- If the user gives the AI a nickname, record that as a fact too\n"
+            "- Never mix up who said what — only extract facts about the human\n\n"
+            "MERGE-FIRST RULES (most important):\n"
+            "1. Before adding ANY new line, scan every existing fact for related context.\n"
+            "2. If ANY existing line covers the same general topic — even partially — you MUST\n"
+            "   merge the new detail into that line instead of adding a new one.\n"
+            "   Return: {\"replace\": <1-based line number>, \"fact\": \"<merged compact sentence>\"}\n"
+            "3. The merged line must be AS SHORT AS POSSIBLE while keeping all meaning.\n"
+            "   Combine by listing: e.g. 'User likes RE, software dev, ethical hacking.'\n"
+            "   NOT three separate lines for each topic.\n"
+            "4. Only add a brand-new line (string) if the topic is COMPLETELY absent from ALL existing facts.\n"
+            "5. Each fact ≤ 120 chars, one compact sentence. No filler words.\n"
+            "6. Facts must be about the USER (name, preferences, language, skills, tools, habits, goals).\n"
+            "7. If nothing new was learned, return [].\n"
+            "8. Return ONLY a JSON array — no explanation, no markdown.\n\n"
+            "EXAMPLES of good merging:\n"
+            "  existing line 2: \"User uses Ghidra for RE and CTF.\"\n"
+            "  new info: user also likes software dev and ethical hacking\n"
+            "  → {\"replace\": 2, \"fact\": \"User uses Ghidra for RE/CTF; likes software dev and ethical hacking.\"}\n\n"
+            "  existing line 1: \"User's name is Alex.\"\n"
+            "  new info: user also goes by 'Al'\n"
+            "  → {\"replace\": 1, \"fact\": \"User's name is Alex (also Al).\"}\n\n"
+            f"EXISTING FACTS:\n{existing_block}\n\n"
+            f"CONVERSATION HISTORY (last 6000 chars):\n{history_text[-6000:]}\n\n"
+            "Return ONLY a JSON array. Elements:\n"
+            "  - {\"replace\": <1-based line number>, \"fact\": \"<merged compact sentence>\"} — PREFERRED\n"
+            "  - \"<new fact>\" — ONLY if topic is completely absent from all existing facts\n"
+        )
+        try:
+            agent   = FreeLLM(model=self.model)
+            raw     = agent.ask(prompt).strip()
+            # Strip optional markdown fences
+            raw     = re.sub(r"^```[a-z]*\n?", "", raw).strip().rstrip("`").strip()
+            parsed  = json.loads(raw)
+            if isinstance(parsed, list):
+                result = []
+                for item in parsed:
+                    if isinstance(item, dict) and "replace" in item and "fact" in item:
+                        result.append(item)
+                    elif isinstance(item, str) and item.strip():
+                        result.append(item.strip())
+                return result
+        except Exception:
+            pass
+        return []
+
+    def _session_text(self, memory: "MemoryDB") -> str:
+        """Flatten permanent cross-session history into a plain string.
+        Uses profile_log (never cleared) so facts survive fresh-session resets."""
+        rows = memory.get_profile_history(40)   # permanent log, up to 40 turns
+        # Try to get names from existing profile for better labelling
+        existing = self._load()
+        _user_name = "the user"
+        _ai_name   = "the AI"
+        for line in existing:
+            ll = line.lower()
+            if "user's name is" in ll or "user name is" in ll:
+                m = re.search(r"user'?s? name is (\w+)", ll)
+                if m:
+                    _user_name = m.group(1).capitalize()
+            if "calls the ai" in ll:
+                m = re.search(r"calls the ai (\w+)", ll)
+                if m:
+                    _ai_name = m.group(1).capitalize()
+        parts = []
+        for row in rows:
+            role    = row.get("role", "")
+            content = row.get("content", "")
+            label = f"USER ({_user_name})" if role == "user" else f"AI ({_ai_name})"
+            parts.append(f"[{label}]: {content}")
+        return "\n".join(parts)
+
+    # ── Public API ─────────────────────────────────────────────
+    def ensure_file(self):
+        """Create the profile file with seed facts if it doesn't exist."""
+        if not os.path.exists(IMPROVE_PROFILE_PATH):
+            self._save(self.SEED_FACTS)
+            return True
+        return False
+
+    def update(self, memory: "MemoryDB", verbose: bool = True) -> int:
+        """
+        Derive new/merged facts from session history and update the profile.
+        - New facts are appended only if not already covered.
+        - Existing facts can be MERGED/REPLACED with richer versions.
+        - verbose=False: silent update (used on auto-exit, no output printed).
+        Returns the total number of changes (additions + merges).
+        """
+        self.ensure_file()
+        existing = self._load()
+
+        history_text = self._session_text(memory)
+        if not history_text.strip():
+            if verbose:
+                print(c("dim", "  [improve] No session history to learn from yet."))
+                self.show()
+            return 0
+
+        if verbose:
+            print(c("dim", "  [improve] Scanning session for new facts..."), end="", flush=True)
+        raw_items = self._derive_new_facts(history_text, existing)
+        if verbose:
+            print(c("green", " done"))
+
+        updated = list(existing)   # mutable copy
+        changes = 0
+
+        for item in raw_items:
+            # ── replacement / merge ────────────────────────────────
+            if isinstance(item, dict):
+                idx = item.get("replace")
+                merged = str(item.get("fact", "")).strip()
+                if not merged or not isinstance(idx, int):
+                    continue
+                real_idx = idx - 1   # 1-based → 0-based
+                if 0 <= real_idx < len(updated):
+                    old_line = updated[real_idx]
+                    if merged != old_line:
+                        updated[real_idx] = merged
+                        if verbose:
+                            print(c("yellow", f"  [improve] ↺ Merged line {idx}:"))
+                            print(c("dim",    f"    was : {old_line}"))
+                            print(c("cyan",   f"    now : {merged}"))
+                        changes += 1
+                continue
+
+            # ── brand-new fact ─────────────────────────────────────
+            fact = str(item).strip()
+            if not fact:
+                continue
+            if self._is_duplicate(fact, updated):
+                continue
+            updated.append(fact)
+            if verbose:
+                print(c("cyan", f"  [improve] + New: {fact}"))
+            changes += 1
+
+        if changes:
+            self._save(updated)
+        elif verbose:
+            print(c("dim", "  [improve] Nothing new — profile already up to date."))
+
+        if verbose:
+            self.show()
+        return changes
+
+    def _is_duplicate(self, candidate: str, existing: list) -> bool:
+        """Lightweight semantic-ish duplicate check without an LLM call.
+        Splits both strings into word sets and checks for high overlap."""
+        if not existing:
+            return False
+        c_words = set(re.sub(r"[^\w]", " ", candidate.lower()).split())
+        for line in existing:
+            l_words = set(re.sub(r"[^\w]", " ", line.lower()).split())
+            if not c_words or not l_words:
+                continue
+            overlap = len(c_words & l_words) / max(len(c_words), len(l_words))
+            if overlap >= 0.65:   # 65% word overlap → treat as duplicate
+                return True
+        return False
+
+    def show(self):
+        """Print current profile to terminal."""
+        lines = self._load()
+        if not lines:
+            print(c("yellow", "  [improve] Profile file is empty or missing."))
+            return
+        print(c("cyan", f"\n  ╔══ USER PROFILE ({IMPROVE_PROFILE_PATH}) {'═'*20}"))
+        for i, ln in enumerate(lines, 1):
+            print(c("dim", f"  ║  {i:>2}. ") + ln)
+        print(c("cyan", f"  ╚{'═'*62}\n"))
+
+    def inject_into_prompt(self) -> str:
+        """Return a short context block to prepend to AI prompts."""
+        lines = self._load()
+        if not lines:
+            return ""
+        facts = "\n".join(f"  - {l}" for l in lines[:20])
+        return (
+            "══ USER PROFILE (learned preferences) ══\n"
+            f"{facts}\n"
+            "════════════════════════════════════════\n"
+        )
+
+    def preferred_language(self) -> str:
+        """Scan profile lines for a language preference and return it.
+        Returns empty string if none found."""
+        lang_keywords = {
+            "bangla": "Bangla", "bengali": "Bangla",
+            "hindi": "Hindi", "arabic": "Arabic",
+            "french": "French", "spanish": "Spanish",
+            "german": "German", "chinese": "Chinese",
+            "japanese": "Japanese", "korean": "Korean",
+            "russian": "Russian", "portuguese": "Portuguese",
+            "turkish": "Turkish", "urdu": "Urdu",
+            "persian": "Persian", "farsi": "Persian",
+        }
+        for line in self._load():
+            lower = line.lower()
+            if "language" in lower or "communicat" in lower or "prefer" in lower or "talk" in lower or "speak" in lower:
+                for kw, label in lang_keywords.items():
+                    if kw in lower:
+                        return label
+            # Also catch bare mentions like "User prefers Bangla."
+            for kw, label in lang_keywords.items():
+                if kw in lower:
+                    return label
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════
 # TELEGRAM NOTIFIER
 # ══════════════════════════════════════════════════════════════
 
@@ -755,6 +1036,15 @@ class MemoryDB:
                     status    TEXT,
                     timestamp TEXT DEFAULT (datetime('now'))
                 )""")
+            # Permanent profile log — never cleared, accumulates across sessions
+            # so _improver.update() always has data even after clear_history()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS profile_log (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role      TEXT NOT NULL,
+                    content   TEXT NOT NULL,
+                    timestamp TEXT DEFAULT (datetime('now'))
+                )""")
             conn.commit()
 
     # ── Conversation ───────────────────────────────────────
@@ -763,12 +1053,25 @@ class MemoryDB:
             conn.execute(
                 "INSERT INTO conversations (role, content, model) VALUES (?,?,?)",
                 (role, content, model))
+            # Also append to permanent profile_log (never cleared)
+            conn.execute(
+                "INSERT INTO profile_log (role, content) VALUES (?,?)",
+                (role, content[:2000]))
             conn.commit()
 
     def get_history(self, limit: int = MAX_HISTORY) -> list:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT role, content FROM conversations ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+    def get_profile_history(self, limit: int = 40) -> list:
+        """Return permanent cross-session history for profile learning.
+        Never cleared — survives clear_history() calls."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM profile_log ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()
         return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
@@ -2130,6 +2433,23 @@ OR for pure knowledge questions:
         re.IGNORECASE
     )
 
+    # Fast-path regex: pure casual chat — ALWAYS informational, skip LLM call
+    # These are short greetings, name-exchanges, compliments, small talk
+    _CASUAL_RE = re.compile(
+        r'^(hello|hi|hey|hiya|sup|salut|yo|howdy|'
+        r'how are you|kemon acho|kemon achen|ki khobor|ki obostha|'
+        r'tumi ke|ami ke|tomar nam ki|tomar nam|ami.*nam|amar nam|'
+        r'tumi.*bolo|bolo amar|apnar nam|tumi.*bujhcho|'
+        r'thik ache|okay|ok|thanks|thank you|dhonnobad|shukriya|'
+        r'good|nice|cool|great|awesome|wow|lol|haha|'
+        r'ami.*apurbo|ami apurbo|amar nam.*apurbo|apurbo.*ami|'
+        r'tomar nam.*ima|tumi.*ima|ima.*tumi|'
+        r'bye|goodbye|see you|abar dekha hobe|'
+        r"what'?s up|what is up|hows it going)"
+        r'[\s!?.]*$',
+        re.IGNORECASE
+    )
+
     def __init__(self, model: str = DEFAULT_MODEL, mcp_active: bool = False):
         self.model           = model
         self._question_count = 0
@@ -2145,6 +2465,13 @@ OR for pure knowledge questions:
             "intent": "task", "ready": True, "found_in": "fallback",
             "enriched_task": user_input, "question": None,
         }
+
+        # ── Fast path: casual chat — ALWAYS informational, no LLM call needed ─
+        if self._CASUAL_RE.match(user_input.strip()):
+            return {
+                "intent": "informational", "ready": True, "found_in": "task",
+                "enriched_task": user_input, "question": None,
+            }
 
         # ── Fast path: obvious task patterns ──────────────────────────────
         if self._TASK_RE.search(user_input):
@@ -2400,6 +2727,9 @@ class PlannerEngine:
                 "Use curl instead for single-URL requests."
             )
         payloads_str = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(self.CURL_XSS_PAYLOADS))
+        # ── User profile facts (from --improve / learned preferences) ──
+        user_profile_block = profile.get("user_profile_facts", "")
+
         mcp_ctx        = profile.get("active_mcp_tools", "")
         mcp_name       = profile.get("active_mcp_name", "")
         mcp_schema_ctx = profile.get("active_mcp_schema", "")
@@ -2534,6 +2864,7 @@ PATH TRAVERSAL payloads to try via execute_command:
         return textwrap.dedent(f"""
 You are Hackers AI — an autonomous Linux agent with full shell access.
 
+{user_profile_block}
 LIVE SYSTEM:
   Distro   : {profile.get('distro','Linux')}
   Kernel   : {profile.get('kernel','')}
@@ -2703,9 +3034,62 @@ class ResponseGenerator:
 
     def ask(self, user_input: str, history: list, profile: dict) -> str:
         tools_str = ", ".join(profile.get("available_tools", [])[:30])
-        system_ctx = textwrap.dedent(f"""
-You are Hackers AI — a powerful Linux agent assistant. Developed by AKM Korishee Apurbo (@IMApurbo)
+        user_profile_block = profile.get("user_profile_facts", "")
 
+        # Dynamically extract known user name and AI nickname from profile facts
+        _user_name   = None   # unknown until user tells us
+        _ai_nickname = None   # unknown until user gives one
+        for line in (user_profile_block or "").splitlines():
+            ll = line.lower()
+            if _user_name is None and ("user's name is" in ll or "user name is" in ll):
+                m = re.search(r"user'?s? name is (\w+)", ll)
+                if m:
+                    _user_name = m.group(1).capitalize()
+            if _ai_nickname is None and "calls the ai" in ll:
+                m = re.search(r"calls the ai (\w+)", ll)
+                if m:
+                    _ai_nickname = m.group(1).capitalize()
+
+        # Build identity block only with what is actually known
+        identity_lines = [
+            "━━━ IDENTITY ━━━",
+            "You are the AI assistant in this conversation.",
+        ]
+        if _ai_nickname:
+            identity_lines.append(f"The user has given you the nickname '{_ai_nickname}' — use it as your own name.")
+        else:
+            identity_lines.append("If the user gives you a nickname, accept it immediately and use it as your own name.")
+        if _user_name:
+            identity_lines.append(f"The user's name is {_user_name} — address them by name naturally.")
+        else:
+            identity_lines.append("If the user tells you their name, use it naturally going forward.")
+        identity_lines += [
+            "NEVER call the user by your own nickname.",
+            "NEVER call yourself by the user's name.",
+            "Keep these roles clear in every reply.",
+        ]
+        identity_block = "\n".join(identity_lines)
+
+        # Build conversation prefix labels from known names
+        user_label = _user_name or "USER"
+        ai_label   = _ai_nickname or "AI"
+
+        system_ctx = textwrap.dedent(f"""
+⚠ ABSOLUTE OUTPUT RULE — READ FIRST, NEVER BREAK:
+You MUST write EVERY word using ONLY plain English/Latin letters (a-z A-Z).
+ZERO exceptions. No Bengali script. No Arabic. No Chinese. No Devanagari. No Cyrillic.
+No Unicode language characters of ANY kind.
+If the user speaks Bangla → write Bangla phonetically: "kemon acho", "ami valo achi".
+If the user speaks Hindi → "kya haal hai", "theek hai".
+If ANY non-Latin character appears in your output it is a CRITICAL FAILURE.
+
+{identity_block}
+
+━━━ PERSONALITY & CONVERSATION RULES ━━━
+You are Hackers AI — a skilled, friendly Linux/hacking assistant with a real personality.
+Developed by AKM Korishee Apurbo (@IMApurbo).
+
+{user_profile_block}
 SYSTEM:
   OS: {profile.get('distro','Linux')} | Kernel: {profile.get('kernel','')}
   Host: {profile.get('hostname','')} | IP: {profile.get('ip','')} | Root: True
@@ -2713,18 +3097,26 @@ SYSTEM:
   Target: {profile.get('sticky_target','(none)')}
   Tools: {tools_str}
 
-RULES:
-- Be SHORT and direct — no fluff
-- NEVER use markdown: no ``` fences, no ** bold, no # headers
-- Show commands as plain text on their own line, e.g.:  nc -zv 192.168.0.1 80
-- Reference CWD and target when relevant
+BEHAVIOUR:
+- Warm, casual, human personality — not a cold robot
+- Accept any nickname the user gives YOU (the AI) and use it as your own name going forward
+- For casual chat / greetings / small talk: JUST CHAT BACK. Do NOT mention commands, scanning,
+  reverse engineering, or any technical work unless the user brings it up first.
+- NEVER redirect casual conversation toward hacking topics or commands unprompted
+- NEVER suggest commands or ask "what do you need?" after casual messages
+- Only mention hacking/commands when the user EXPLICITLY asks for technical help
+- Be SHORT — no long paragraphs
+- No markdown: no ``` fences, no ** bold, no # headers
+- Commands on plain text lines
+
+REMINDER — OUTPUT IN LATIN LETTERS ONLY. NOT A SINGLE NON-LATIN CHARACTER.
         """).strip()
         parts = [system_ctx, "\n--- RECENT CONVERSATION ---"]
         for h in history[-4:]:
-            prefix  = "USER" if h["role"] == "user" else "AI"
+            prefix  = user_label if h["role"] == "user" else ai_label
             content = h["content"][:300].replace("\n", " ")
             parts.append(f"{prefix}: {content}")
-        parts.append(f"\nUSER: {user_input}\nAI:")
+        parts.append(f"\n{user_label}: {user_input}\n{ai_label}:")
         agent    = FreeLLM(model=self.model)
         response = agent.ask("\n".join(parts))
         response = re.sub(r"^\s*USER:.*?\n", "", response, flags=re.IGNORECASE).strip()
@@ -3354,8 +3746,21 @@ class Summarizer:
     def __init__(self, model: str = DEFAULT_MODEL):
         self.model = model
 
-    def summarize(self, raw_results: str, original_request: str, history: list) -> str:
+    def summarize(self, raw_results: str, original_request: str, history: list,
+                  profile: dict = None) -> str:
+        profile = profile or {}
+        lang_rule = (
+            "Write the summary in the same language the user used for their request. "
+            "CRITICAL: ALWAYS use only English/Latin letters — never native scripts "
+            "(no Bengali/Arabic/Chinese/Devanagari/Cyrillic or any non-Latin characters). "
+            "Write all languages phonetically. "
+            "Example: Bangla request → 'scan shesh, port 22 open ache' not Bengali script."
+        )
         system_ctx = textwrap.dedent(f"""
+⚠ ABSOLUTE OUTPUT RULE: Use ONLY plain English/Latin letters (a-z A-Z 0-9).
+Zero non-Latin Unicode characters. No Bengali/Arabic/Chinese/Devanagari script.
+Write any language phonetically with English letters only.
+
 You are Hackers AI. Write a SHORT, accurate summary of what just happened.
 
 Rules:
@@ -3366,6 +3771,8 @@ Rules:
 - Install → state what was installed and result
 - Simple command → result in 1-2 sentences
 - PLAIN TEXT ONLY — no markdown, no ``` fences, no ** bold, no # headers
+- Write in the same language the user used, but ONLY with Latin letters
+- REMINDER: zero non-Latin characters in output
 
 Task: {original_request}
         """).strip()
@@ -3702,7 +4109,7 @@ class CLI:
         "/help":    "Show this help",
         "/clear":   "Clear conversation history",
         "/history": "Show last 10 messages",
-        "/profile": "Show live system profile",
+        "/profile": "System profile | /profile memory — show learned facts | /profile edit — edit learned facts",
         "/tools":   "List detected pentest tools",
         "/sysinfo": "Run live system info commands",
         "/switch":  "Switch model: /switch <model>",
@@ -3718,10 +4125,10 @@ class CLI:
         "/config":  "Open MCP config file in editor (~/.hackers_ai_mcp.json)",
         "/telegram":"Remote control via Telegram: /telegram --api-token T --user-id U",
         "/mcp":     "MCP: /mcp list|use <name>|exit|reload|tools [name]|call <tool> [args]|ai <task>",
-        "/exit":    "Exit Hackers AI",
+        "/exit":    "Save memory + exit Hackers AI",
     }
 
-    def __init__(self):
+    def __init__(self, improve: bool = False):
         self.model         = DEFAULT_MODEL
         self.memory        = MemoryDB()
         self.profiler      = SystemProfiler()
@@ -3735,6 +4142,16 @@ class CLI:
         self._tg = TelegramBot()
         # When True: auto-confirm plans, skip interactive prompts (Telegram mode)
         self._tg_mode = False
+        # User profile improver (active when --improve / -i flag is passed)
+        self._improve_mode = improve
+        self._improver = UserProfileImprover(model=self.model)
+        if improve:
+            created = self._improver.ensure_file()
+            if created:
+                print(c("cyan", f"  [improve] ✨ Created user profile: {IMPROVE_PROFILE_PATH}"))
+            else:
+                print(c("dim",  f"  [improve] Profile: {IMPROVE_PROFILE_PATH}"))
+            self._improver.show()
 
         _sudo_user = os.environ.get("SUDO_USER")
         self.cwd = os.path.expanduser(f"~{_sudo_user}") if _sudo_user else os.getcwd()
@@ -3925,6 +4342,36 @@ class CLI:
             return True
 
         if slug == "/profile":
+            sub = arg.strip().lower() if arg else ""
+
+            # /profile memory — show learned user facts
+            if sub == "memory":
+                self._improver.show()
+                return True
+
+            # /profile edit — open profile file in editor
+            if sub == "edit":
+                editor = (
+                    os.environ.get("VISUAL")
+                    or os.environ.get("EDITOR")
+                    or shutil.which("nano")
+                    or shutil.which("vi")
+                    or "nano"
+                )
+                self._improver.ensure_file()
+                print(c("cyan", f"\n  Opening learned memory in {editor}..."))
+                print(c("dim",  f"  File: {IMPROVE_PROFILE_PATH}"))
+                print(c("dim",  "  One fact per line. Save and exit editor to apply changes.\n"))
+                try:
+                    subprocess.run([editor, IMPROVE_PROFILE_PATH])
+                    print(c("green", "  ✓ Memory updated."))
+                    self._improver.show()
+                except Exception as e:
+                    print(c("red", f"  Could not open editor: {e}"))
+                    print(c("dim", f"  Edit manually: nano {IMPROVE_PROFILE_PATH}"))
+                return True
+
+            # /profile (no sub) — show system profile
             print()
             for k, v in self.profile.items():
                 if k in {"available_tools","uname"}:
@@ -3934,6 +4381,7 @@ class CLI:
                 print(f"  {c('cyan','sticky_target:'): <20} {self.sticky_target}")
             if self._mcp_client:
                 print(f"  {c('cyan','active_mcp:'): <20} {self._mcp_client.name}")
+            print(c("dim", "\n  Tip: /profile memory  — learned facts | /profile edit — edit them"))
             print()
             return True
 
@@ -4100,13 +4548,20 @@ class CLI:
             return self._handle_telegram(arg)
 
         if slug == "/exit":
+            print(c("cyan", "\n  [memory] Saving learned facts from this session..."))
+            try:
+                changes = self._improver.update(self.memory, verbose=True)
+                if changes == 0:
+                    print(c("dim", "  [memory] Nothing new to save — profile already up to date."))
+            except Exception as e:
+                print(c("yellow", f"  [memory] Warning: could not update profile: {e}"))
             print(c("cyan", "\n  Goodbye.\n"))
-            self._shutdown()
+            self._shutdown(skip_profile_update=True)
             sys.exit(0)
 
         return False
 
-    def _shutdown(self, reason: str = ""):
+    def _shutdown(self, reason: str = "", skip_profile_update: bool = False):
         """Close every active connection cleanly: MCP server + Telegram bot."""
         # 1. Stop MCP subprocess and clear the DB record so _restore_mcp()
         #    does NOT reconnect it on the next startup.
@@ -4124,7 +4579,14 @@ class CLI:
         except Exception:
             pass
 
-        # 2. Stop Telegram bridge
+        # 2. Update user profile on exit — skipped when /exit already ran it verbosely
+        if not skip_profile_update:
+            try:
+                self._improver.update(self.memory, verbose=False)
+            except Exception:
+                pass
+
+        # 3. Stop Telegram bridge
         if self._tg.enabled or (self._tg._thread and self._tg._thread.is_alive()):
             try:
                 self._tg.stop(reason=reason) if reason else self._tg.stop()
@@ -4792,6 +5254,9 @@ Output ONLY JSON lines. No explanation, no markdown.
         self.profile["real_home"] = (os.path.expanduser(f"~{_su}") if _su
                                      else os.path.expanduser("~"))
         self.profile["sticky_target"] = self.sticky_target or "(none set)"
+        # Inject learned user-profile facts so the planner can personalise responses
+        self.profile["user_profile_facts"]    = self._improver.inject_into_prompt()
+        self.profile["user_preferred_lang"]   = self._improver.preferred_language()
         # Inject active MCP tools + full per-tool schema into profile for planner
         if self._mcp_client:
             tools = self._mcp_client.list_tools()
@@ -4955,7 +5420,7 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         print(c("dim", "\n  [→] Summarizing..."))
         _task_end = time.time()
-        summary = Summarizer(model=self.model).summarize(raw, user_input, history)
+        summary = Summarizer(model=self.model).summarize(raw, user_input, history, self.profile)
         self._print_response(summary)
         self.memory.add_message("user",      user_input, self.model)
         self.memory.add_message("assistant", summary,    self.model)
@@ -5138,5 +5603,11 @@ if __name__ == "__main__":
     if os.path.isdir(_cache):
         shutil.rmtree(_cache, ignore_errors=True)
 
-    cli = CLI()
+    # ── CLI flags ──────────────────────────────────────────────
+    _improve_mode = "-i" in sys.argv or "--improve" in sys.argv
+    for _f in ("-i", "--improve"):
+        while _f in sys.argv:
+            sys.argv.remove(_f)
+
+    cli = CLI(improve=_improve_mode)
     cli.run()
