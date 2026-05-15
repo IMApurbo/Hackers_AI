@@ -2608,6 +2608,26 @@ class PlannerEngine:
                             else:
                                 print(c("dim", f"  [Planner] MCP mode — dropped {stype} step: {desc_lower[:55]}"))
                                 continue
+                        # ── Plan-time schema strip for mcp_call steps ───────────
+                        if stype == "mcp_call":
+                            _ac = getattr(self, "_mcp_client", None)
+                            if _ac:
+                                _tn = step.get("tool", "")
+                                _ta = step.get("args") or {}
+                                _ts = {}
+                                for _tt in (_ac.list_tools() or []):
+                                    if _tt.get("name") == _tn:
+                                        _ts = _tt.get("inputSchema") or {}
+                                        break
+                                _tp = _ts.get("properties", {}) if isinstance(_ts, dict) else {}
+                                if _tp:
+                                    _vk  = set(_tp.keys())
+                                    _bk  = set(_ta.keys()) - _vk
+                                    if _bk:
+                                        print(c("yellow",
+                                            f"  [Planner] ✂ stripped hallucinated args for "
+                                            f"{_tn}: {sorted(_bk)}"))
+                                        step["args"] = {k: v for k, v in _ta.items() if k in _vk}
                         FORBIDDEN_DESCS = [
                             "analyze result", "analyse result",
                             "summarize result", "summarise result",
@@ -2778,6 +2798,13 @@ MCP RULES:
        • unknown parameter → use a tool to inspect the environment or resources
      Chain that discovery step (depends_on=[]) ahead of the steps that need its output.
   7. Prefer acting and discovering over asking. The user wants results, not questions.
+  8. CRITICAL — ARGS MUST MATCH SCHEMA EXACTLY:
+     • Use ONLY the parameter names shown in the TOOL CATALOGUE above.
+     • NEVER invent parameters not listed (e.g. never add "offset", "count",
+       "limit", "page", "pagination" unless they explicitly appear in the tool's ARGS).
+     • For REQUIRED params: you MUST supply a value — use the EXAMPLE as a template.
+     • For OPTIONAL params: omit them unless you have a specific value to pass.
+     • If a tool has no args (ARGS: none), pass an empty args dict: "args": {{}}
 """).strip()
         else:
             mcp_block = ""
@@ -2968,6 +2995,20 @@ warning: null or string (not the string "null")
                 "RESPOND WITH ONLY A ```json ... ``` FENCED BLOCK — NOTHING ELSE."
             )
         prompt = "\n".join(base_parts)
+        # Pre-build a schema lookup dict for plan-time arg stripping
+        _plan_schemas: dict = {}
+        _plan_mcp_client = getattr(self, "_mcp_client", None)
+        if _plan_mcp_client:
+            try:
+                for _pt in (_plan_mcp_client.list_tools() or []):
+                    _pn = _pt.get("name", "")
+                    _ps = _pt.get("inputSchema") or {}
+                    _pp = _ps.get("properties", {}) if isinstance(_ps, dict) else {}
+                    if _pn and _pp:
+                        _plan_schemas[_pn] = set(_pp.keys())
+            except Exception:
+                pass
+
         for attempt in range(1, 4):
             try:
                 agent = FreeLLM(model=model)
@@ -2992,6 +3033,21 @@ warning: null or string (not the string "null")
                             else:
                                 print(c("dim", f"  [Planner] MCP mode — dropped {stype} step: {desc_lower[:55]}"))
                                 continue
+                        # ── Plan-time schema strip for mcp_call steps ───────────
+                        # Remove any args the LLM hallucinated that don't exist in
+                        # the real tool schema (e.g. offset, count, limit, page …)
+                        if stype == "mcp_call" and _plan_schemas:
+                            t_name = step.get("tool", "")
+                            t_args = step.get("args") or {}
+                            if t_name in _plan_schemas:
+                                valid_keys = _plan_schemas[t_name]
+                                bad_keys   = set(t_args.keys()) - valid_keys
+                                if bad_keys:
+                                    print(c("yellow",
+                                        f"  [Planner] ✂ stripped hallucinated args for "
+                                        f"{t_name}: {sorted(bad_keys)}"))
+                                    step["args"] = {k: v for k, v in t_args.items()
+                                                    if k in valid_keys}
                         FORBIDDEN_DESCS = [
                             "analyze result", "analyse result",
                             "summarize result", "summarise result",
@@ -3382,25 +3438,56 @@ class ExecutionEngine:
                 # Strip planning-context keys from bad_args before showing the LLM
                 valid_keys = set(props.keys())
                 clean_bad  = {k: v for k, v in bad_args.items() if k in valid_keys}
-                # Build param hint: name*(type): description
+
+                # Build param hint: REQUIRED/OPTIONAL  name(type): description
+                # Also build example values for required params
                 hints = []
+                example_args = {}
                 for pn, pi in (props.items() if isinstance(props, dict) else []):
-                    star = "*" if pn in req else ""
-                    pt   = pi.get("type", "any") if isinstance(pi, dict) else "any"
-                    pd   = pi.get("description", "") if isinstance(pi, dict) else ""
-                    hints.append(f"  {pn}{star}({pt}): {pd[:60]}")
+                    label = "REQUIRED" if pn in req else "OPTIONAL"
+                    if isinstance(pi, dict):
+                        pt = pi.get("type", "any")
+                        if pi.get("enum"):
+                            pt = "|".join(str(e) for e in pi["enum"][:6])
+                        pd = pi.get("description", "") if isinstance(pi, dict) else ""
+                        # Build a sensible example value
+                        if pi.get("enum"):
+                            example_args[pn] = pi["enum"][0]
+                        elif pt == "integer":
+                            example_args[pn] = 0
+                        elif pt == "boolean":
+                            example_args[pn] = False
+                        elif pt == "array":
+                            example_args[pn] = []
+                        else:
+                            example_args[pn] = f"<{pn}>"
+                    else:
+                        pt = "any"
+                        pd = ""
+                        example_args[pn] = f"<{pn}>"
+                    hints.append(f"  {label:<8} {pn} ({pt}): {pd[:70]}")
+
                 schema_hint = "\n".join(hints) if hints else "(no schema available)"
+                req_example = {k: v for k, v in example_args.items() if k in req}
+
                 # Tell the LLM what valid values already exist so it can carry them over
                 prompt = (
-                    f"MCP tool call failed — the args dict had wrong/missing keys.\n"
+                    f"An MCP tool call failed because the args dict had wrong or missing keys.\n"
                     f"Tool        : {t_name}\n"
-                    f"Valid args so far: {json.dumps(clean_bad)}\n"
+                    f"Valid args from prior attempt: {json.dumps(clean_bad)}\n"
                     f"Error       : {err_txt[:400]}\n\n"
                     f"EXACT PARAMETER SCHEMA for {t_name}:\n{schema_hint}\n\n"
-                    f"Required params marked with *. Infer sensible values for any missing "
-                    f"required params from the tool name and valid args above.\n"
-                    f"Return ONLY a JSON object with ALL required parameters using the EXACT "
-                    f"parameter names listed above. Nothing else — just the JSON object."
+                    f"EXAMPLE of correct required args: {json.dumps(req_example)}\n\n"
+                    f"RULES:\n"
+                    f"1. Return ONLY a JSON object — nothing else, no explanation.\n"
+                    f"2. Include ALL REQUIRED params using the EXACT param names above.\n"
+                    f"3. Infer sensible string values for any missing required params based "
+                    f"   on the tool name ('{t_name}') and context from valid args.\n"
+                    f"4. Do NOT include OPTIONAL params unless you have a specific value.\n"
+                    f"5. Do NOT include any params not listed in the schema above.\n"
+                    f"6. If a required param is a search term or keyword, infer it from "
+                    f"   the tool name (e.g. get_android_manifest → no args needed, "
+                    f"   search_classes_by_keyword → search_term might be 'Activity').\n"
                 )
                 try:
                     agent   = FreeLLM(model=self.model)
@@ -3409,11 +3496,22 @@ class ExecutionEngine:
                     if isinstance(fixed, dict):
                         # Always restrict the result to valid schema keys
                         fixed = {k: v for k, v in fixed.items() if k in valid_keys}
-                        # Ensure all required keys are present
-                        if all(r in fixed for r in req):
-                            return fixed
-                        _lp(c("yellow", f"  [MCP] ⚠ LLM fix missing required keys: "
-                              f"{[r for r in req if r not in fixed]}"))
+                        missing_req = [r for r in req if r not in fixed]
+                        if missing_req:
+                            _lp(c("yellow", f"  [MCP] ⚠ LLM fix missing required keys: {missing_req}"))
+                            # Last resort: fill missing required string params with empty string
+                            # so the call at least goes through and returns a real error
+                            for mk in missing_req:
+                                pi = props.get(mk, {})
+                                pt = pi.get("type", "string") if isinstance(pi, dict) else "string"
+                                if pt == "integer":
+                                    fixed[mk] = 0
+                                elif pt == "boolean":
+                                    fixed[mk] = False
+                                elif pt == "array":
+                                    fixed[mk] = []
+                                else:
+                                    fixed[mk] = ""
                         return fixed if fixed else None
                 except Exception:
                     pass
@@ -5278,39 +5376,71 @@ Output ONLY JSON lines. No explanation, no markdown.
     @staticmethod
     def _build_mcp_schema_text(client) -> str:
         """
-        Verbose tool catalogue with per-param descriptions so the LLM
-        picks exact arg names on the first try.
+        Explicit tool catalogue with REQUIRED/OPTIONAL labels and full JSON
+        example args so the LLM generates correct args on the first try.
+
         Format per tool:
-          tool_name(param*(type) — param desc, ...) — tool desc
+          TOOL: tool_name
+          DESC: tool description
+          ARGS:
+            REQUIRED  param_name (type): description
+            OPTIONAL  param_name (type): description
+          EXAMPLE: {"param": "value"}
+          ──────────────────────────
         """
         tools = client.list_tools()
         if not tools:
             return "(no tools)"
         lines = []
+        lines.append("=" * 60)
+        lines.append("MCP TOOL CATALOGUE — USE EXACT PARAM NAMES BELOW")
+        lines.append("WARNING: Do NOT add offset/count/pagination unless listed here.")
+        lines.append("=" * 60)
         for t in tools:
             name   = t.get("name", "?")
-            tdesc  = (t.get("description") or "").replace("\n", " ").strip()[:90]
+            tdesc  = (t.get("description") or "").replace("\n", " ").strip()
             schema = t.get("inputSchema") or {}
             props  = schema.get("properties", {}) if isinstance(schema, dict) else {}
             req    = set(schema.get("required", [])) if isinstance(schema, dict) else set()
-            params = []
-            for pname, pinfo in (props.items() if isinstance(props, dict) else []):
-                star  = "*" if pname in req else ""
-                if isinstance(pinfo, dict):
-                    ptype = pinfo.get("type", "any")
-                    if pinfo.get("enum"):
-                        ptype = "|".join(str(e) for e in pinfo["enum"][:5])
-                    pdesc = pinfo.get("description", "").replace("\n"," ").strip()[:50]
-                else:
-                    ptype = "any"
-                    pdesc = ""
-                hint = f"{pname}{star}({ptype})"
-                if pdesc:
-                    hint += f"={pdesc}"
-                params.append(hint)
-            param_str = ", ".join(params) if params else "no params"
-            lines.append(f"  {name}({param_str})")
-            lines.append(f"    → {tdesc}")
+
+            lines.append(f"\nTOOL: {name}")
+            lines.append(f"DESC: {tdesc[:120]}")
+
+            if props:
+                lines.append("ARGS:")
+                example_args = {}
+                for pname, pinfo in (props.items() if isinstance(props, dict) else []):
+                    label = "REQUIRED" if pname in req else "OPTIONAL"
+                    if isinstance(pinfo, dict):
+                        ptype = pinfo.get("type", "any")
+                        if pinfo.get("enum"):
+                            ptype = "|".join(str(e) for e in pinfo["enum"][:6])
+                        pdesc = pinfo.get("description", "").replace("\n", " ").strip()[:80]
+                        # Build example value
+                        if pinfo.get("enum"):
+                            example_args[pname] = pinfo["enum"][0]
+                        elif ptype == "integer":
+                            example_args[pname] = 0
+                        elif ptype == "boolean":
+                            example_args[pname] = False
+                        elif ptype == "array":
+                            example_args[pname] = []
+                        else:
+                            example_args[pname] = f"<{pname}>"
+                    else:
+                        ptype = "any"
+                        pdesc = ""
+                        example_args[pname] = f"<{pname}>"
+                    lines.append(f"  {label:<8} {pname} ({ptype}): {pdesc}")
+                # Only show required args in example to keep it clean
+                req_example = {k: v for k, v in example_args.items() if k in req}
+                if not req_example:
+                    req_example = example_args  # fall back to all if none required
+                lines.append(f"EXAMPLE: {json.dumps(req_example)}")
+            else:
+                lines.append("ARGS: (none — call with empty args {})")
+                lines.append("EXAMPLE: {}")
+            lines.append("─" * 50)
         return "\n".join(lines)
 
     def process(self, user_input: str):
