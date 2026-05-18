@@ -2548,7 +2548,8 @@ class PlannerEngine:
     ]
 
     def plan_next(self, original_task: str, completed_steps: list,
-                  profile: dict, model: str = DEFAULT_MODEL) -> Optional[dict]:
+                  profile: dict, model: str = DEFAULT_MODEL,
+                  _mcp_client=None) -> Optional[dict]:
         completed_str = "\n".join(
             f"Step {s['id']} — {s['desc']}:\n{s['output'][:800]}"
             for s in completed_steps
@@ -2595,27 +2596,33 @@ class PlannerEngine:
                     for step in plan["steps"]:
                         stype      = step.get("type", "command")
                         desc_lower = (step.get("description") or "").lower()
-                        # In MCP mode: convert command/python steps or drop them
+                        # In MCP mode: prefer MCP tools, but allow fallback to
+                        # native command/python when no MCP tool covers the task.
                         if mcp_active and stype not in ("mcp_call", "info"):
                             exec_tool = profile.get("active_mcp_exec_tool", "")
                             if stype == "command" and exec_tool:
-                                # Rewrite as mcp_call → execute_command
+                                # Rewrite as mcp_call -> execute_command (MCP shell tool)
                                 step["type"] = "mcp_call"
                                 step["args"] = {"command": step.get("command", "")}
                                 step["tool"] = exec_tool
                                 step["command"] = ""
                                 print(c("dim", f"  [Planner] MCP mode — rewrote command→{exec_tool}: {desc_lower[:50]}"))
+                            elif stype == "command":
+                                # No exec_tool available — run as native shell command
+                                print(c("dim", f"  [Planner] MCP mode — no exec_tool, native shell: {desc_lower[:50]}"))
+                            elif stype == "python":
+                                # Python steps always run natively (MCP has no Python runner)
+                                print(c("dim", f"  [Planner] MCP mode — python step runs natively: {desc_lower[:50]}"))
                             else:
-                                print(c("dim", f"  [Planner] MCP mode — dropped {stype} step: {desc_lower[:55]}"))
+                                print(c("dim", f"  [Planner] MCP mode — dropped unknown type '{stype}': {desc_lower[:50]}"))
                                 continue
                         # ── Plan-time schema strip for mcp_call steps ───────────
                         if stype == "mcp_call":
-                            _ac = getattr(self, "_mcp_client", None)
-                            if _ac:
+                            if _mcp_client:
                                 _tn = step.get("tool", "")
                                 _ta = step.get("args") or {}
                                 _ts = {}
-                                for _tt in (_ac.list_tools() or []):
+                                for _tt in (_mcp_client.list_tools() or []):
                                     if _tt.get("name") == _tn:
                                         _ts = _tt.get("inputSchema") or {}
                                         break
@@ -2980,11 +2987,14 @@ warning: null or string (not the string "null")
         if profile.get("active_mcp_tools"):
             base_parts.append(
                 f"[NEW TASK]: {user_input}\n"
-                "IMPORTANT: ALL steps MUST be type=mcp_call. "
-                "Use ONLY tool names from the MCP TOOL CATALOGUE above. "
-                "Put actual arg values in the args dict — match EXACT parameter names. "
-                "If any context is missing (target, path, ID, etc.), add a discovery "
-                "step first using an MCP tool — do NOT ask the user for information. "
+                "PRIORITY RULES for MCP mode:\n"
+                "1. ALWAYS prefer type=mcp_call for any action covered by the MCP TOOL CATALOGUE.\n"
+                "2. If a task cannot be done with any MCP tool, use type=command (shell) or type=python.\n"
+                "3. python steps: type=python, command=empty string, description=what to do.\n"
+                "4. command steps: type=command, command=<shell command>.\n"
+                "5. For mcp_call: put arg values in args dict — match EXACT parameter names from catalogue.\n"
+                "6. If context is missing (target, path, ID), add a discovery step (MCP tool preferred) first.\n"
+                "7. Do NOT ask the user for information — act and discover.\n"
                 "RESPOND WITH ONLY A ```json ... ``` FENCED BLOCK — NOTHING ELSE."
             )
         else:
@@ -3020,18 +3030,25 @@ warning: null or string (not the string "null")
                     for step in plan["steps"]:
                         stype      = step.get("type", "command")
                         desc_lower = (step.get("description") or "").lower()
-                        # In MCP mode: convert command/python steps or drop them
+                        # In MCP mode: prefer MCP tools, but allow fallback to
+                        # native command/python when no MCP tool covers the task.
                         if mcp_active and stype not in ("mcp_call", "info"):
                             exec_tool = profile.get("active_mcp_exec_tool", "")
                             if stype == "command" and exec_tool:
-                                # Rewrite as mcp_call → execute_command
+                                # Rewrite as mcp_call -> execute_command (MCP shell tool)
                                 step["type"] = "mcp_call"
                                 step["args"] = {"command": step.get("command", "")}
                                 step["tool"] = exec_tool
                                 step["command"] = ""
                                 print(c("dim", f"  [Planner] MCP mode — rewrote command→{exec_tool}: {desc_lower[:50]}"))
+                            elif stype == "command":
+                                # No exec_tool available — run as native shell command
+                                print(c("dim", f"  [Planner] MCP mode — no exec_tool, native shell: {desc_lower[:50]}"))
+                            elif stype == "python":
+                                # Python steps always run natively (MCP has no Python runner)
+                                print(c("dim", f"  [Planner] MCP mode — python step runs natively: {desc_lower[:50]}"))
                             else:
-                                print(c("dim", f"  [Planner] MCP mode — dropped {stype} step: {desc_lower[:55]}"))
+                                print(c("dim", f"  [Planner] MCP mode — dropped unknown type '{stype}': {desc_lower[:50]}"))
                                 continue
                         # ── Plan-time schema strip for mcp_call steps ───────────
                         # Remove any args the LLM hallucinated that don't exist in
@@ -3819,7 +3836,8 @@ class DynamicExecutionEngine:
             if not dependent:
                 print(c("dim", "\n  [→] Checking if more steps needed..."))
                 next_plan = self.planner.plan_next(
-                    original_task, completed, profile, self.model
+                    original_task, completed, profile, self.model,
+                    _mcp_client=getattr(self.engine, "_mcp_client", None)
                 )
                 if not next_plan or not next_plan.get("steps"):
                     print(c("green", "  ✓ Task complete."))
@@ -3828,7 +3846,8 @@ class DynamicExecutionEngine:
             else:
                 print(c("dim", "\n  [→] Generating dependent steps with real output..."))
                 next_plan = self.planner.plan_next(
-                    original_task, completed, profile, self.model
+                    original_task, completed, profile, self.model,
+                    _mcp_client=getattr(self.engine, "_mcp_client", None)
                 )
                 if not next_plan or not next_plan.get("steps"):
                     break
