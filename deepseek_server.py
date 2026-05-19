@@ -37,14 +37,22 @@ from deepseek_scraper import DeepSeekScraper
 
 _scraper: DeepSeekScraper | None = None
 _scraper_lock = threading.Lock()
-_headless_flag = False          # overridden by CLI arg before first use
+_headless_flag    = False          # overridden by CLI arg before first use
+_search_flag      = False          # --search
+_deepthink_flag   = False          # --deepthink
+_expert_flag      = False          # --expert
 
 
 def get_scraper() -> DeepSeekScraper:
     global _scraper
     with _scraper_lock:
         if _scraper is None:
-            _scraper = DeepSeekScraper(headless=_headless_flag)
+            _scraper = DeepSeekScraper(
+                headless=_headless_flag,
+                enable_search=_search_flag,
+                enable_deepthink=_deepthink_flag,
+                enable_expert=_expert_flag,
+            )
             _scraper.start()
         return _scraper
 
@@ -347,11 +355,20 @@ if __name__ == "__main__":
     ap.add_argument("--host",      default="0.0.0.0",      help="Bind host (default: 0.0.0.0)")
     ap.add_argument("--port",      default=8765, type=int,  help="Port (default: 8765)")
     ap.add_argument("--headless",  action="store_true",     help="Run Chromium headless")
+    ap.add_argument("--search",    action="store_true",
+                    help="Enable the Search toggle in DeepSeek UI (default: off)")
+    ap.add_argument("--deepthink", action="store_true",
+                    help="Enable the DeepThink toggle in DeepSeek UI (default: off)")
+    ap.add_argument("--expert",    action="store_true",
+                    help="Enable the Expert model in DeepSeek UI (default: off)")
     ap.add_argument("--no-warmup", action="store_true",
                     help="Lazy-init: don't pre-launch the browser on startup")
     args = ap.parse_args()
 
-    _headless_flag = args.headless
+    _headless_flag  = args.headless
+    _search_flag    = args.search
+    _deepthink_flag = args.deepthink
+    _expert_flag    = args.expert
 
     banner = f"""
 {'=' * 60}
@@ -359,6 +376,9 @@ if __name__ == "__main__":
 {'=' * 60}
   Listening on : http://{args.host}:{args.port}
   Headless     : {args.headless}
+  Search       : {args.search}
+  DeepThink    : {args.deepthink}
+  Expert model : {args.expert}
 
   Configure your tool:
     export ANTHROPIC_BASE_URL="http://localhost:{args.port}"
