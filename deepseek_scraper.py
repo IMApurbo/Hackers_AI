@@ -500,12 +500,21 @@ class DeepSeekScraper:
     # Idle/done state:    ._52c986b present  AND  .bd74640a PRESENT AND  aria-disabled=true
     STOP_BTN_ACTIVE_SEL = "div._52c986b:not(.bd74640a)"
 
-    def __init__(self, headless: bool = False):
-        self.headless   = headless
-        self.browser    = None
-        self.context    = None
-        self.page       = None
-        self.playwright = None
+    def __init__(
+        self,
+        headless:        bool = False,
+        enable_search:   bool = False,
+        enable_deepthink: bool = False,
+        enable_expert:   bool = False,
+    ):
+        self.headless         = headless
+        self.enable_search    = enable_search
+        self.enable_deepthink = enable_deepthink
+        self.enable_expert    = enable_expert
+        self.browser          = None
+        self.context          = None
+        self.page             = None
+        self.playwright       = None
 
     # ─────────────────────────────────────────────────────────
     # Browser Setup
@@ -555,6 +564,8 @@ class DeepSeekScraper:
         with _spinner_ctx("Waiting for input box…"):
             self._wait_for_input()
         console.print("[success]✔[/success]  Chat input ready\n")
+
+        self._configure_toggles()
 
     # ─────────────────────────────────────────────────────────
     # Session Persistence
@@ -710,6 +721,138 @@ class DeepSeekScraper:
         except Exception:
             console.print("[error]✘  Input not found — page may need login[/error]")
             console.print(f"[muted]   {self.page.url}[/muted]")
+
+    # ─────────────────────────────────────────────────────────
+    # Toggle Configuration (Search / DeepThink / Expert)
+    # ─────────────────────────────────────────────────────────
+
+    def _configure_toggles(self):
+        """
+        Enable or disable the Search, DeepThink, and Expert toggles
+        according to the flags set at construction time.
+
+        Toggle state is read from aria-pressed (Search / DeepThink) and
+        aria-checked (Expert).  The class ``ds-toggle-button--selected``
+        is also present when a toggle is active, but aria-pressed is the
+        canonical source of truth.
+
+        Search is ON by default in the DeepSeek UI, so we always run this
+        method — even when no flags are set — so we can turn Search off.
+
+        Button identification
+        ────────────────────
+        Search and DeepThink share the same CSS classes:
+          off: ds-atom-button f79352dc ds-toggle-button ds-toggle-button--md
+          on:  … ds-toggle-button--selected …
+
+        We locate them by inner text (case-insensitive) so the logic stays
+        correct even if DeepSeek reorders the toolbar.
+
+        Expert uses [data-model-type="expert"] with aria-checked.
+        """
+        console.print("[info]  Configuring feature toggles…[/info]")
+
+        # ── helpers ───────────────────────────────────────────
+
+        def _find_toggle_by_text(label_text: str):
+            """
+            Return the first ds-toggle-button whose visible text contains
+            label_text (case-insensitive).  Returns None when not found.
+            """
+            try:
+                # aria-pressed is present on both enabled and disabled states
+                candidates = self.page.locator(
+                    "button.ds-toggle-button[aria-pressed], "
+                    "div.ds-toggle-button[aria-pressed]"
+                )
+                count = candidates.count()
+                for i in range(count):
+                    el = candidates.nth(i)
+                    try:
+                        text = (el.inner_text() or "").strip().lower()
+                    except Exception:
+                        text = ""
+                    if label_text.lower() in text:
+                        return el
+                # Fallback: return None — caller will warn
+                return None
+            except Exception:
+                return None
+
+        def _toggle_button(label: str, want_enabled: bool):
+            """
+            Click a Search/DeepThink toggle only when its current state
+            differs from want_enabled.
+            """
+            btn = _find_toggle_by_text(label)
+            if btn is None:
+                console.print(
+                    f"[warning]⚠  {label} toggle not found — skipping[/warning]"
+                )
+                return
+            try:
+                current = (btn.get_attribute("aria-pressed") or "false").lower()
+                is_on   = current == "true"
+                if want_enabled and not is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print(f"[success]✔[/success]  {label} enabled")
+                elif not want_enabled and is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print(f"[muted]  {label} disabled[/muted]")
+                else:
+                    state = "on" if is_on else "off"
+                    console.print(
+                        f"[muted]  {label} already {state} — no change[/muted]"
+                    )
+            except Exception as e:
+                console.print(f"[warning]⚠  {label} toggle error: {e}[/warning]")
+
+        def _toggle_expert(want_enabled: bool):
+            """
+            Select or deselect the Expert model option.
+            Uses aria-checked (not aria-pressed) on [data-model-type="expert"].
+            """
+            try:
+                btn = self.page.locator("[data-model-type='expert']").first
+                if btn.count() == 0:
+                    console.print(
+                        "[warning]⚠  Expert model button not found — skipping[/warning]"
+                    )
+                    return
+                current = (btn.get_attribute("aria-checked") or "false").lower()
+                is_on   = current == "true"
+                if want_enabled and not is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print("[success]✔[/success]  Expert model enabled")
+                elif not want_enabled and is_on:
+                    btn.click()
+                    time.sleep(0.4)
+                    console.print("[muted]  Expert model disabled[/muted]")
+                else:
+                    state = "on" if is_on else "off"
+                    console.print(
+                        f"[muted]  Expert model already {state} — no change[/muted]"
+                    )
+            except Exception as e:
+                console.print(f"[warning]⚠  Expert toggle error: {e}[/warning]")
+
+        # ── Search ────────────────────────────────────────────
+        # Default in the DeepSeek UI is ON — turn it off unless --search was given.
+        _toggle_button("Search", want_enabled=self.enable_search)
+
+        # ── DeepThink ─────────────────────────────────────────
+        # Default is OFF — only enable when --deepthink was given.
+        _toggle_button("DeepThink", want_enabled=self.enable_deepthink)
+
+        # ── Expert model ──────────────────────────────────────
+        # Default is OFF — only enable when --expert was given.
+        if self.enable_expert:
+            _toggle_expert(want_enabled=True)
+
+        console.print()
 
     # ─────────────────────────────────────────────────────────
     # Core: Send Message
