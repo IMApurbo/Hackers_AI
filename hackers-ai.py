@@ -29,6 +29,85 @@ import urllib.request
 import urllib.error
 
 # ══════════════════════════════════════════════════════════════
+# TERMINAL WIDTH HELPER
+# ══════════════════════════════════════════════════════════════
+def _tw(indent: int = 2, fallback: int = 80) -> int:
+    """Return usable terminal width minus left indent. Min 40."""
+    cols = shutil.get_terminal_size(fallback=(fallback, 24)).columns
+    return max(40, cols - indent)
+
+def _strip_ansi_g(s: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+def _box_row(content: str, border_char: str = "║", total_width: int = 0,
+             prefix: str = "  ", pad_char: str = " ") -> str:
+    """Return a box content row padded to total_width with right border.
+    total_width = full terminal width (includes prefix+left border).
+    The row looks like:  <prefix><border_char> <content...pad> <border_char>
+    If total_width==0, calls _tw() automatically."""
+    if total_width == 0:
+        total_width = _tw() + len(prefix)  # _tw already subtracts indent
+    # visible length of content
+    vis = len(_strip_ansi_g(content))
+    # space available between the two border chars:  total - len(prefix) - 2(borders) - 2(spaces)
+    inner = total_width - len(prefix) - 4
+    padding = max(0, inner - vis)
+    return f"{prefix}{border_char} {content}{pad_char * padding} {border_char}"
+
+def _box_top(title: str, color: str = "cyan", tl: str = "╔", h: str = "═",
+             tr: str = "╗", prefix: str = "  ") -> tuple:
+    """Return (top_line, bw) where bw is the box width to pass to _box_row and _box_bot.
+    top_line looks like:  <prefix><tl><h><h> TITLE <h>...<h><tr>
+    bw = _tw() + len(prefix)  — pass this as total_width to _box_row and _box_bot."""
+    bw = _tw() + len(prefix)
+    # inner width = bw - len(prefix) - 2 (left+right border chars)
+    inner = bw - len(prefix) - 2
+    label = f"{h}{h} {title} "
+    fill  = max(1, inner - len(label))
+    line  = f"{prefix}{tl}{label}{h * fill}{tr}"
+    return c(color, line), bw
+
+def _box_bot(bw: int, color: str = "cyan", bl: str = "╚", h: str = "═",
+             br: str = "╝", prefix: str = "  ") -> str:
+    """Return bottom border that exactly matches a top produced by _box_top(bw=bw)."""
+    inner = bw - len(prefix) - 2
+    return c(color, f"{prefix}{bl}{h * inner}{br}")
+
+def _box_inner(bw: int, prefix: str = "  ") -> int:
+    """Usable content width inside a box: bw - len(prefix) - 2(borders) - 2(spaces)."""
+    return bw - len(prefix) - 4
+
+def _box_safe(text: str, bw: int, border: str = "║",
+              prefix: str = "  ", color: str = "") -> list:
+    """Return a list of _box_row strings for `text`, guaranteed to never overflow bw.
+
+    Handles:
+    - Strips ANSI for width measurement so colour never counts as width.
+    - Splits on embedded newlines first.
+    - Hard-wraps any fragment that still exceeds the inner width.
+    - Optionally re-applies `color` to each wrapped fragment.
+    """
+    inner = _box_inner(bw, prefix)
+    rows  = []
+    for raw_line in text.splitlines():
+        clean = _strip_ansi_g(raw_line).rstrip()
+        if not clean:
+            rows.append(_box_row("", border, bw, prefix))
+            continue
+        while clean:
+            if len(clean) <= inner:
+                fragment = c(color, clean) if color else clean
+                rows.append(_box_row(fragment, border, bw, prefix))
+                break
+            # prefer to split at last space before limit; hard-cut if none
+            cut = clean.rfind(" ", 0, inner)
+            cut = cut if cut > 0 else inner
+            fragment = c(color, clean[:cut]) if color else clean[:cut]
+            rows.append(_box_row(fragment, border, bw, prefix))
+            clean = clean[cut:].lstrip()
+    return rows
+
+# ══════════════════════════════════════════════════════════════
 # READLINE SETUP — arrow keys, history, cursor movement
 # ══════════════════════════════════════════════════════════════
 try:
@@ -292,10 +371,14 @@ class UserProfileImprover:
         if not lines:
             print(c("yellow", "  [improve] Profile file is empty or missing."))
             return
-        print(c("cyan", f"\n  ╔══ USER PROFILE ({IMPROVE_PROFILE_PATH}) {'═'*20}"))
+        print()
+        _top, _bw = _box_top(f"USER PROFILE ({IMPROVE_PROFILE_PATH})", "cyan")
+        print(_top)
         for i, ln in enumerate(lines, 1):
-            print(c("dim", f"  ║  {i:>2}. ") + ln)
-        print(c("cyan", f"  ╚{'═'*62}\n"))
+            _row = f"  {i:>2}. {ln}"
+            print(_box_row(_row, "║", _bw))
+        print(_box_bot(_bw, "cyan"))
+        print()
 
     def inject_into_prompt(self) -> str:
         """Return a short context block to prepend to AI prompts."""
@@ -2932,6 +3015,13 @@ LIVE SYSTEM:
 11. ADAPTIVE steps: if a step's command depends on the RESULT of a previous
     step (not just a file), make it type="python" so it can subprocess the
     prior result and decide what to run.{mcp_type_note}
+12. NEVER use 'cd' in shell commands — cd is a shell built-in and CANNOT be
+    run as a standalone command or pre-flight step. Instead, ALWAYS use full
+    absolute paths directly in every command. For example:
+      WRONG : cd /home/user/Desktop && mv *.txt /tmp/
+      RIGHT : mv /home/user/Desktop/*.txt /tmp/
+    If multiple commands must operate in the same directory, embed the path
+    in each command individually rather than chaining with cd.
 
 ═══ OUTPUT FORMAT — CRITICAL ═══
 YOUR ENTIRE RESPONSE MUST BE EXACTLY THIS — NOTHING ELSE:
@@ -3292,7 +3382,7 @@ class ExecutionEngine:
                 for i, s in enumerate(batch):
                     conn = "├─" if i < len(batch)-1 else "└─"
                     self._lprint(c("dim", f"     {conn} [{s.get('id')}] {s.get('description','')[:65]}"))
-                self._lprint(c("dim", "  " + "─"*62))
+                self._lprint(c("dim", "  " + "─"*(_tw()-2)))
 
                 threads       = []
                 batch_results = {}
@@ -3648,6 +3738,11 @@ class ExecutionEngine:
                 "chown", "touch", "grep", "awk", "sed", "find", "curl",
                 "wget", "ping", "ssh", "scp", "tar", "zip", "unzip",
                 "python3", "python", "bash", "sh", "which", "true", "false",
+                # Shell built-ins — never installable, skip pre-flight entirely
+                "cd", "source", "export", "alias", "unalias", "set", "unset",
+                "exit", "exec", "eval", "read", "printf", "type", "help",
+                "history", "jobs", "fg", "bg", "wait", "trap", "return",
+                "break", "continue", "shift", "getopts", "umask", "ulimit",
             ):
                 _lp(c("yellow", f"\n  [Pre-flight] '{bin_name}' not found — installing before run..."))
                 ok, method, _ = self.analyzer.installer.install(bin_name)
@@ -4047,10 +4142,11 @@ class ReconPipeline:
         os.makedirs(outdir, exist_ok=True)
         wordlists = self._wl_finder.scan()
 
-        print(c("green", "\n  ╔══ RECON PIPELINE ══════════════════════════════════════════"))
-        print(c("green", f"  ║  Target : {c('white', domain)}"))
-        print(c("green", f"  ║  Output : {outdir}"))
-        print(c("green",  "  ╚" + "═"*62))
+        _rtop, _rbw = _box_top("RECON PIPELINE", "green")
+        print("\n" + _rtop)
+        print(_box_row(f"Target : {domain}", "║", _rbw))
+        print(_box_row(f"Output : {outdir}", "║", _rbw))
+        print(_box_bot(_rbw, "green"))
 
         report_parts = [
             f"# Recon Report: {domain}",
@@ -4189,12 +4285,13 @@ class ReconPipeline:
             )
             agent      = FreeLLM(model=self.model)
             ai_summary = agent.ask(prompt).strip()
-            print(c("red", "  ╔══ AI ASSESSMENT " + "═"*44))
+            _atop, _abw = _box_top("AI ASSESSMENT", "red")
+            print(_atop)
             for line in ai_summary.splitlines():
                 sc = "red" if "critical" in line.lower() else \
                      "yellow" if "high" in line.lower() else "white"
-                print(c("red", "  ║ ") + c(sc, line))
-            print(c("red", f"  ╚{'═'*62}"))
+                print(_box_row(c(sc, line), "║", _abw))
+            print(_box_bot(_abw, "red"))
             report_parts += ["## AI Assessment", "", ai_summary, ""]
         except Exception as e:
             print(c("dim", f"  [!] AI summary error: {e}"))
@@ -4423,7 +4520,8 @@ class CLI:
 
         if slug == "/help":
             print()
-            print(c("yellow", "  ╔══ HACKERS AI COMMANDS " + "═"*39))
+            _htop, _hbw = _box_top("HACKERS AI COMMANDS", "yellow")
+            print(_htop)
             cats = [
                 ("General",  ["/help","/clear","/history","/profile","/tools","/sysinfo","/switch","/exit"]),
                 ("Session",  ["/target","/auth","/shell","/save","/dryrun"]),
@@ -4432,11 +4530,11 @@ class CLI:
                 ("Notify",   ["/telegram"]),
             ]
             for cat, keys in cats:
-                print(c("yellow", f"  ║  {c('white', cat)}"))
+                print(_box_row(c("white", cat), "║", _hbw))
                 for k in keys:
                     v = self.SLASH_COMMANDS.get(k, "")
-                    print(f"  {c('yellow','║')}    {c('cyan', k):<28} {v}")
-            print(c("yellow", "  ╚" + "═"*61))
+                    print(_box_row(f"  {c('cyan', k):<28} {v}", "║", _hbw))
+            print(_box_bot(_hbw, "yellow"))
             print()
             return True
 
@@ -4776,19 +4874,26 @@ class CLI:
                 print()
                 return True
             print()
-            print(c("cyan", "  ╔══ MCP SERVERS (from ~/.hackers_ai_mcp.json) " + "═"*18))
+            _mtop, _mbw = _box_top("MCP SERVERS (from ~/.hackers_ai_mcp.json)", "cyan")
+            print(_mtop)
+            _mi = _box_inner(_mbw)
             for name, scfg in servers.items():
-                act     = c("green", " ● ACTIVE") if name == active else c("dim", " ○")
-                cmd_str = scfg.get("command", "?")
-                args    = scfg.get("args", [])
-                args_str = " ".join(str(a) for a in args[:3])
-                if len(args) > 3:
-                    args_str += " ..."
+                is_active = (name == active)
+                act_badge = c("green", "● ACTIVE") if is_active else c("dim", "○")
+                cmd_str   = scfg.get("command", "?")
+                args      = scfg.get("args", [])
+                args_str  = " ".join(str(a) for a in args[:4])
+                if len(args) > 4:
+                    args_str += " …"
                 env_keys = list((scfg.get("env") or {}).keys())
-                env_str  = f"  env:[{','.join(env_keys)}]" if env_keys else ""
-                print(c("cyan", "  ║ ") +
-                      f"{c('white', name):<20} {cmd_str} {args_str[:40]}{env_str}{act}")
-            print(c("cyan", "  ╚" + "═"*62))
+                env_str  = f" env:[{','.join(env_keys)}]" if env_keys else ""
+                # Row 1: name + status badge (always fits)
+                print(_box_row(f"{c('white', name)}  {act_badge}", "║", _mbw))
+                # Row 2+: command path + args + env, safe-wrapped so nothing overflows
+                detail = f"  {cmd_str} {args_str}{env_str}".rstrip()
+                for row in _box_safe(detail, _mbw, "║"):
+                    print(row)
+            print(_box_bot(_mbw, "cyan"))
             print(c("dim",  "  /mcp use <name>     — connect to a server"))
             print(c("dim",  "  /config              — edit config file"))
             print()
@@ -4850,17 +4955,31 @@ class CLI:
             self.memory.set_mcp_active(sub1)
             if tools:
                 print()
-                print(c("cyan", f"  ╔══ {sub1.upper()} TOOLS " + "═"*48))
+                _t1top, _t1bw = _box_top(f"{sub1.upper()} TOOLS", "cyan")
+                print(_t1top)
+                _t1i = _box_inner(_t1bw)
                 for t in tools[:25]:
                     schema = t.get("inputSchema", {}) or {}
                     props  = schema.get("properties", {}) if isinstance(schema, dict) else {}
                     params = ", ".join(props.keys()) if props else ""
-                    desc   = t.get("description", "")[:55]
-                    print(c("cyan", "  ║ ") + c("white", f"{t['name']:<22}") +
-                          c("dim", f"({params})") + c("dim", f"  {desc}"))
+                    # First line: name + params (capped so it can't overflow)
+                    name_part   = t["name"]
+                    params_part = f"({params})" if params else "()"
+                    # cap params display so name+params never exceeds inner width
+                    max_params  = max(8, _t1i - len(name_part) - 3)
+                    if len(params_part) > max_params:
+                        params_part = params_part[:max_params - 1] + "…"
+                    print(_box_row(c("white", f"{name_part:<22}") + c("dim", params_part), "║", _t1bw))
+                    # Second line: description — strip newlines, wrap to fit
+                    raw_desc = t.get("description", "").replace("\n", " ").replace("\r", "").strip()
+                    if raw_desc:
+                        # indent + cap at one wrapped line max (2 rows)
+                        desc_lines = _box_safe("  " + raw_desc, _t1bw, "║", color="dim")
+                        for dl in desc_lines[:2]:
+                            print(dl)
                 if len(tools) > 25:
-                    print(c("dim", f"  ║  ... +{len(tools)-25} more  (/mcp tools for full list)"))
-                print(c("cyan", "  ╚" + "═"*62))
+                    print(_box_row(f"  … +{len(tools)-25} more tools  (use /mcp tools for full list)", "║", _t1bw))
+                print(_box_bot(_t1bw, "cyan"))
             resources = self._mcp_client.list_resources()
             if resources:
                 print(c("dim", f"\n  Resources ({len(resources)}):"))
@@ -4908,7 +5027,8 @@ class CLI:
                 return True
             srv_name = client.name
             print()
-            print(c("cyan", f"  ╔══ {srv_name.upper()} — {len(tools)} TOOLS " + "═"*35))
+            _sttop, _stbw = _box_top(f"{srv_name.upper()} — {len(tools)} TOOLS", "cyan")
+            print(_sttop)
             for t in tools:
                 schema = t.get("inputSchema", {}) or {}
                 props  = schema.get("properties", {}) if isinstance(schema, dict) else {}
@@ -4919,10 +5039,16 @@ class CLI:
                     ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
                     params_parts.append(f"{pname}{star}:{ptype}")
                 params_str = ", ".join(params_parts) or "—"
-                print(c("cyan", "  ║ ") + c("white", t["name"]))
-                print(c("cyan", "  ║   ") + c("dim", f"{t.get('description','')[:75]}"))
-                print(c("cyan", "  ║   ") + c("dim", f"params: {params_str}"))
-            print(c("cyan", "  ╚" + "═"*62))
+                # Tool name row
+                print(_box_row(c("white", t["name"]), "║", _stbw))
+                # Description — sanitise newlines, safe-wrap all lines
+                raw_desc = (t.get("description") or "").replace("\r", "").strip()
+                for row in _box_safe(raw_desc, _stbw, "║", color="dim"):
+                    print(row)
+                # Params — safe-wrap in case param list is very long
+                for row in _box_safe(f"params: {params_str}", _stbw, "║", color="dim"):
+                    print(row)
+            print(_box_bot(_stbw, "cyan"))
             print()
             return True
 
@@ -4955,13 +5081,29 @@ class CLI:
                     print(c("red", text[:800]))
                 else:
                     print(c("green", "  ✓ Result:"))
-                    print(c("dim", "  ┌" + "─"*61))
-                    for line in (text or "(empty)").splitlines()[:80]:
-                        print(c("dim", "  │ ") + line)
-                    extra = text.count("\n") - 80
+                    _tdw  = _tw()
+                    _tdbw = _tdw + 4   # total_width for _box_row: prefix(2)+left+inner+right
+                    print(c("dim", "  ┌" + "─"*(_tdw) + "┐"))
+                    _td_inner = _box_inner(_tdbw)
+                    _td_lines = (text or "(empty)").splitlines()
+                    shown = 0
+                    for raw_line in _td_lines[:80]:
+                        # sanitise and hard-wrap each output line
+                        clean = _strip_ansi_g(raw_line).rstrip()
+                        while True:
+                            if len(clean) <= _td_inner:
+                                print(_box_row(clean, "│", _tdbw, pad_char=" "))
+                                shown += 1
+                                break
+                            cut = clean.rfind(" ", 0, _td_inner)
+                            cut = cut if cut > 0 else _td_inner
+                            print(_box_row(clean[:cut], "│", _tdbw, pad_char=" "))
+                            shown += 1
+                            clean = clean[cut:].lstrip()
+                    extra = len(_td_lines) - 80
                     if extra > 0:
-                        print(c("dim", f"  │ ... ({extra} more lines)"))
-                    print(c("dim", "  └" + "─"*61))
+                        print(_box_row(f"  … {extra} more lines not shown", "│", _tdbw))
+                    print(c("dim", "  └" + "─"*(_tdw) + "┘"))
                 print()
             except Exception as e:
                 print(c("red", f"  [MCP] Error: {e}"))
@@ -5035,10 +5177,14 @@ Output ONLY JSON lines. No explanation, no markdown.
                 )
                 summary = agent.ask(summary_prompt).strip()
                 print()
-                print(c("green", "  ╭─ MCP Result Summary " + "─"*40))
+                _mrbw     = _tw() + 2
+                _mr_inner = _mrbw - 4
+                _mr_label = "─ MCP Result Summary "
+                _mr_fill  = _mr_inner - len(_mr_label)
+                print(c("green", "  ╭" + _mr_label + "─" * max(1, _mr_fill) + "╮"))
                 for line in summary.splitlines():
-                    print(c("dim", "  │ ") + line)
-                print(c("green", "  ╰" + "─"*61))
+                    print(_box_row(line, "│", _mrbw))
+                print(c("green", "  ╰" + "─" * _mr_inner + "╯"))
                 print()
             return True
 
@@ -5074,14 +5220,15 @@ Output ONLY JSON lines. No explanation, no markdown.
                 state   = c("green","RUNNING") if running else c("yellow","STOPPED")
                 uid     = cfg.get("user_id","?")
                 tok     = cfg.get("token","")[:10] + "..." + cfg.get("token","")[-4:]
-                print(c("cyan", "  ╔══ TELEGRAM BOT ══════════════════════════════════"))
-                print(c("cyan", f"  ║  State   : {state}"))
-                print(c("cyan", f"  ║  Token   : {tok}"))
-                print(c("cyan", f"  ║  User ID : {uid}"))
-                print(c("cyan",  "  ║"))
-                print(c("cyan",  "  ║  Send any message to your bot on Telegram and"))
-                print(c("cyan",  "  ║  Hackers AI will execute it and reply with output."))
-                print(c("cyan",  "  ╚" + "═"*50))
+                _tgtop, _tgbw = _box_top("TELEGRAM BOT", "cyan")
+                print(_tgtop)
+                print(_box_row(f"State   : {state}", "║", _tgbw))
+                print(_box_row(f"Token   : {tok}", "║", _tgbw))
+                print(_box_row(f"User ID : {uid}", "║", _tgbw))
+                print(_box_row("", "║", _tgbw))
+                print(_box_row("Send any message to your bot on Telegram and", "║", _tgbw))
+                print(_box_row("Hackers AI will execute it and reply with output.", "║", _tgbw))
+                print(_box_bot(_tgbw, "cyan"))
             print()
             return True
 
@@ -5214,18 +5361,19 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         # ── Terminal mode ──────────────────────────────────────────
         print()
-        print(c("yellow", "  ╔══ SCOPE CONFIRMATION ══════════════════════════════════"))
-        print(c("yellow", f"  ║  Target: {c('white', host)}"))
-        print(c("yellow",  "  ║  This target is not local and not in your authorized list."))
-        print(c("yellow",  "  ║"))
-        print(c("yellow",  "  ║  Only test systems you OWN or have WRITTEN PERMISSION to test."))
-        print(c("yellow",  "  ║  Unauthorized testing is illegal."))
-        print(c("yellow",  "  ║"))
-        print(c("yellow",  "  ║  Options:"))
-        print(c("yellow",  "  ║    y = proceed this time (not saved)"))
-        print(c("yellow", f"  ║    a = proceed and add '{host}' to authorized list"))
-        print(c("yellow",  "  ║    n = cancel (default)"))
-        print(c("yellow",  "  ╚" + "═"*62))
+        _sctop, _scbw = _box_top("SCOPE CONFIRMATION", "yellow")
+        print(_sctop)
+        print(_box_row(f"Target: {c('white', host)}", "║", _scbw))
+        print(_box_row("This target is not local and not in your authorized list.", "║", _scbw))
+        print(_box_row("", "║", _scbw))
+        print(_box_row("Only test systems you OWN or have WRITTEN PERMISSION to test.", "║", _scbw))
+        print(_box_row("Unauthorized testing is illegal.", "║", _scbw))
+        print(_box_row("", "║", _scbw))
+        print(_box_row("Options:", "║", _scbw))
+        print(_box_row("  y = proceed this time (not saved)", "║", _scbw))
+        print(_box_row(f"  a = proceed and add '{host}' to authorized list", "║", _scbw))
+        print(_box_row("  n = cancel (default)", "║", _scbw))
+        print(_box_bot(_scbw, "yellow"))
         try:
             ans = input(c("cyan", "  I confirm I have authorization [y/a/N]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -5321,24 +5469,26 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         # ── Terminal mode ──────────────────────────────────────
         print()
-        w = c("yellow", "║")
-        print(c("yellow", "  ╔══ EXECUTION PLAN " + "═"*43))
-        print(f"  {w}  {c('white','Summary')} : {plan.get('summary','N/A')}")
-        print(f"  {w}  {c('white','Steps  ')} : {len(plan.get('steps', []))}")
+        _eptop, _epbw = _box_top("EXECUTION PLAN", "yellow")
+        print(_eptop)
+        _ep_inner = _epbw - 2 - 2   # inner width for the ╠══ STEPS ╣ separator
+        print(_box_row(f"{c('white','Summary')} : {plan.get('summary','N/A')}", "║", _epbw))
+        print(_box_row(f"{c('white','Steps  ')} : {len(plan.get('steps', []))}", "║", _epbw))
         if self.sticky_target:
-            print(f"  {w}  {c('cyan','Target ')} : {self.sticky_target}")
+            print(_box_row(f"{c('cyan','Target ')} : {self.sticky_target}", "║", _epbw))
         if plan.get("requires_root"):
-            print(f"  {w}  {c('red','⚠ Requires root')}")
+            print(_box_row(c("red", "⚠ Requires root"), "║", _epbw))
         warn = plan.get("warning")
         if warn and str(warn).lower() not in ("null","none",""):
-            print(f"  {w}  {c('red','⚡ WARNING')}: {warn}")
-        print(c("yellow", f"  ╠══ STEPS {chr(9552)*53}"))
+            print(_box_row(f"{c('red','⚡ WARNING')}: {warn}", "║", _epbw))
+        _steps_label = "══ STEPS "
+        print(c("yellow", f"  ╠{_steps_label}{chr(9552) * max(1, _ep_inner - len(_steps_label))}╣"))
         for s in plan.get("steps", []):
             stype = s.get("type","command").upper()
             label = (s.get("command") or s.get("description") or "")[:82]
             tc    = "cyan" if stype == "COMMAND" else "magenta" if stype == "PYTHON" else "dim"
-            print(f"  {w}  [{c(tc, f'{stype:<8}')}] {label}")
-        print(c("yellow", f"  {chr(9562)}{chr(9552)*62}"))
+            print(_box_row(f"[{c(tc, f'{stype:<8}')}] {label}", "║", _epbw))
+        print(_box_bot(_epbw, "yellow"))
         print()
 
         try:
@@ -5358,11 +5508,40 @@ Output ONLY JSON lines. No explanation, no markdown.
             else:
                 print(text)
             return
+        # ── Fit content inside the border ─────────────────────────
+        # bw = total box width (prefix "  " + left border + inner + right border)
+        # inner content width = bw - len("  ") - 4  =  bw - 6
+        bw = _tw() + 2          # e.g. tw=78 → bw=80
+        inner = bw - 6          # e.g. 74  (used for wrapping)
+        # border row inner (between │ chars) = bw - 2(prefix) - 4 = bw-6  ✓ same
+        # top/bottom line inner (between ╭ and ╮) = bw - 2(prefix) - 2 = bw-4
+        top_inner = bw - 4      # e.g. 76
+        label     = "─ Hackers AI "
+        fill      = top_inner - len(label)   # dashes after label up to ╮
+
+        def _strip_ansi(s: str) -> str:
+            return re.sub(r"\033\[[0-9;]*m", "", s)
+
+        def _wrap_line(line: str) -> list:
+            visible = _strip_ansi(line)
+            if len(visible) <= inner:
+                return [line]
+            indent = len(visible) - len(visible.lstrip())
+            wrapped = textwrap.wrap(
+                visible,
+                width=inner,
+                subsequent_indent=" " * indent,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            return wrapped if wrapped else [line]
+
         print()
-        print(c("green", "  ╭─ Hackers AI ") + c("dim", "─"*49))
-        for line in text.splitlines():
-            print(c("dim", "  │ ") + line)
-        print(c("green", "  ╰" + "─"*62))
+        print(c("green", "  ╭") + c("green", label) + c("dim", "─" * max(1, fill)) + c("green", "╮"))
+        for raw_line in text.splitlines():
+            for wrapped in _wrap_line(raw_line):
+                print(_box_row(wrapped, "│", bw))
+        print(c("green", "  ╰" + "─" * top_inner + "╯"))
         print()
 
     def _inject_profile_context(self):
@@ -5514,9 +5693,13 @@ Output ONLY JSON lines. No explanation, no markdown.
             if getattr(self, "_tg_mode", False) and self._tg and self._tg.token:
                 self._tg.send(f"❓ <b>Need more info:</b>\n{question}")
             print()
-            print(c("yellow", "  ╭─ Need more info " + "─"*44))
-            print(c("yellow", f"  │  {question}"))
-            print(c("yellow", "  ╰" + "─"*61))
+            _nibw = _tw() + 2
+            _ni_inner = _nibw - 4
+            _ni_label = "─ Need more info "
+            _ni_fill  = _ni_inner - len(_ni_label)
+            print(c("yellow", "  ╭" + _ni_label + "─" * max(1, _ni_fill) + "╮"))
+            print(_box_row(c("yellow", question), "│", _nibw))
+            print(c("yellow", "  ╰" + "─" * _ni_inner + "╯"))
             print()
             self.memory.add_message("user",      user_input, self.model)
             self.memory.add_message("assistant", f"[Awaiting: {question}]", self.model)
@@ -5599,10 +5782,14 @@ Output ONLY JSON lines. No explanation, no markdown.
             lines = [l.strip() for l in raw.splitlines()
                      if l.strip() and len(l.strip()) > 5][:3]
             if lines:
-                print(c("dim", "  ╭─ Suggested next ─" + "─"*43))
+                _snbw     = _tw() + 2
+                _sn_inner = _snbw - 4
+                _sn_label = "─ Suggested next "
+                _sn_fill  = _sn_inner - len(_sn_label)
+                print(c("dim", "  ╭" + _sn_label + "─" * max(1, _sn_fill) + "╮"))
                 for i, s in enumerate(lines, 1):
-                    print(c("dim","  │ ") + c("cyan", f"  {i}.") + f" {s}")
-                print(c("dim", "  ╰" + "─"*61))
+                    print(_box_row(c("cyan", f"  {i}.") + f" {s}", "│", _snbw))
+                print(c("dim", "  ╰" + "─" * _sn_inner + "╯"))
                 print()
         except Exception:
             pass
