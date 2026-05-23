@@ -385,8 +385,15 @@ class UserProfileImprover:
         _top, _bw = _box_top(f"USER PROFILE ({IMPROVE_PROFILE_PATH})", "cyan")
         print(_top)
         for i, ln in enumerate(lines, 1):
-            _row = f"  {i:>2}. {ln}"
-            print(_box_row(_row, "║", _bw))
+            # First line of entry includes the number prefix
+            prefix = f"  {i:>2}. "
+            indent = " " * len(prefix)
+            first, *rest = (ln or "(empty)").splitlines() or ["(empty)"]
+            for row in _box_safe(prefix + first, _bw, "║"):
+                print(row)
+            for cont in rest:
+                for row in _box_safe(indent + cont, _bw, "║"):
+                    print(row)
         print(_box_bot(_bw, "cyan"))
         print()
 
