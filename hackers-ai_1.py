@@ -28,6 +28,16 @@ import select
 import urllib.request
 import urllib.error
 
+# ── prompt_toolkit (optional — graceful fallback to input()) ──
+try:
+    from prompt_toolkit import PromptSession as _PTSession
+    from prompt_toolkit.completion import Completer as _PTCompleter, Completion as _PTCompletion
+    from prompt_toolkit.styles import Style as _PTStyle
+    from prompt_toolkit.formatted_text import ANSI as _PTANSI
+    _PT_OK = True
+except ImportError:
+    _PT_OK = False
+
 # ══════════════════════════════════════════════════════════════
 # TERMINAL WIDTH HELPER
 # ══════════════════════════════════════════════════════════════
@@ -1744,15 +1754,20 @@ class SmartFileEditor:
     """
     Applies minimal, surgical edits to a file.
 
-    Three operation types (all driven by an LLM-produced JSON plan):
-      • replace  — swap old_text for new_text (first occurrence)
+    Four operation types (all driven by an LLM-produced JSON plan):
+      • replace  — swap old_text for new_text (supports multi-line spans)
       • insert   — insert new_text after the line containing anchor
       • delete   — delete the first line containing target_text
+      • rewrite  — full-file rewrite (fallback for large/complex edits)
 
-    The LLM is asked to produce a list of such ops; we apply them
-    in order and write the file back only once, touching only the
-    changed lines.
+    Matching is done against the whole file as a single string so
+    multi-line old_text patterns work correctly.
     """
+
+    # Max chars sent to LLM in one shot.  Larger files are sent in
+    # CHUNK_SIZE windows centred on the lines most likely to change.
+    PROMPT_LIMIT = 12000
+    CHUNK_SIZE   = 10000
 
     def __init__(self, model: str = DEFAULT_MODEL):
         self.model = model
@@ -1773,14 +1788,20 @@ class SmartFileEditor:
             return self._err(f"File not found: {filepath}", tag, t0)
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                original_lines = f.readlines()
+                original = f.read()
+            original_lines = original.splitlines(keepends=True)
         except Exception as e:
             return self._err(f"Cannot read file: {e}", tag, t0)
 
         # ── 2. Ask the LLM for a minimal ops list ──────────────
-        ops = self._plan_ops(filepath, original_lines, instruction)
+        ops = self._plan_ops(filepath, original, original_lines, instruction)
         if ops is None:
-            return self._err("LLM could not produce a valid edit plan.", tag, t0)
+            # Hard fallback: ask LLM to rewrite the whole file
+            print(c("yellow", "  [SmartEdit] Ops plan failed — attempting full rewrite..."))
+            ops = self._plan_rewrite(filepath, original, instruction)
+            if ops is None:
+                return self._err("LLM could not produce a valid edit plan.", tag, t0)
+
         if not ops:
             return {
                 "success": True, "stdout": "No changes needed.",
@@ -1790,16 +1811,37 @@ class SmartFileEditor:
             }
 
         # ── 3. Apply ops ───────────────────────────────────────
-        lines, applied, errors = list(original_lines), 0, []
+        # Work on the whole file as a string for multi-line replace support,
+        # but keep a lines list for insert/delete ops.
+        content  = original
+        lines    = list(original_lines)
+        applied, errors = 0, []
+
         for op in ops:
             kind = op.get("op", "")
             try:
                 if kind == "replace":
-                    lines, ok = self._op_replace(lines, op["old_text"], op["new_text"])
+                    content, ok = self._op_replace_str(content, op["old_text"], op["new_text"])
+                    if ok:
+                        lines = content.splitlines(keepends=True)
+                    else:
+                        # Fallback: try normalised whitespace match
+                        content, ok = self._op_replace_fuzzy(content, op["old_text"], op["new_text"])
+                        if ok:
+                            lines = content.splitlines(keepends=True)
                 elif kind == "insert":
                     lines, ok = self._op_insert(lines, op["anchor"], op["new_text"])
+                    if ok:
+                        content = "".join(lines)
                 elif kind == "delete":
                     lines, ok = self._op_delete(lines, op["target_text"])
+                    if ok:
+                        content = "".join(lines)
+                elif kind == "rewrite":
+                    # Full-file rewrite op — LLM returns the complete new content
+                    content = op["new_content"]
+                    lines   = content.splitlines(keepends=True)
+                    ok = True
                 else:
                     errors.append(f"Unknown op: {kind}")
                     continue
@@ -1812,12 +1854,30 @@ class SmartFileEditor:
 
         # ── 4. Write back only if something changed ────────────
         if applied == 0:
-            msg = "No ops matched. " + "; ".join(errors)
-            return self._err(msg, tag, t0)
+            # Last-resort: ask LLM to do a full rewrite
+            print(c("yellow", "  [SmartEdit] All ops failed — falling back to full rewrite..."))
+            rw_ops = self._plan_rewrite(filepath, original, instruction)
+            if rw_ops:
+                for op in rw_ops:
+                    if op.get("op") == "rewrite":
+                        content = op["new_content"]
+                        applied += 1
+                        break
+            if applied == 0:
+                msg = "No ops matched. " + "; ".join(errors)
+                return self._err(msg, tag, t0)
+
+        if content == original:
+            return {
+                "success": True, "stdout": "No changes needed (content identical).",
+                "stderr": "", "ops_applied": 0,
+                "returncode": 0, "elapsed": round(time.time() - t0, 2),
+                "cancelled": False, "command": tag,
+            }
 
         try:
             with open(filepath, "w", encoding="utf-8", newline="") as f:
-                f.writelines(lines)
+                f.write(content)
         except Exception as e:
             return self._err(f"Cannot write file: {e}", tag, t0)
 
@@ -1833,50 +1893,96 @@ class SmartFileEditor:
             "cancelled": False, "command": tag,
         }
 
-    # ── LLM planner ────────────────────────────────────────────
-    def _plan_ops(self, filepath: str, lines: list, instruction: str):
+    # ── LLM planners ───────────────────────────────────────────
+    def _plan_ops(self, filepath: str, content: str, lines: list, instruction: str):
+        """Ask the LLM for a minimal surgical ops list.
+        For large files, send a focused window around the most relevant lines."""
         numbered = "".join(f"{i+1}: {l}" for i, l in enumerate(lines))
-        # Keep prompt context under ~6000 chars
-        if len(numbered) > 6000:
-            numbered = numbered[:6000] + "\n... (truncated) ..."
+
+        if len(numbered) > self.PROMPT_LIMIT:
+            # Find the window of lines most likely mentioned in the instruction
+            # by scoring each line for keyword overlap with the instruction.
+            keywords = set(re.findall(r"\b\w{4,}\b", instruction.lower()))
+            scores   = []
+            for i, line in enumerate(lines):
+                sc = sum(1 for kw in keywords if kw in line.lower())
+                scores.append((sc, i))
+            scores.sort(reverse=True)
+            # Grab the top-scoring centre line and expand a window around it
+            centre = scores[0][1] if scores else len(lines) // 2
+            half   = self.CHUNK_SIZE // 2
+            start  = max(0, centre - half // (len(lines[0]) or 1))
+            end    = min(len(lines), start + self.CHUNK_SIZE // (len(lines[0]) or 1))
+            window = lines[start:end]
+            numbered = "".join(f"{start+i+1}: {l}" for i, l in enumerate(window))
+            if len(numbered) > self.PROMPT_LIMIT:
+                numbered = numbered[:self.PROMPT_LIMIT] + "\n... (truncated) ..."
+            trunc_note = (
+                f"NOTE: File has {len(lines)} lines. Showing lines {start+1}–{end} "
+                f"(most relevant window). Use line numbers from this view for anchors.\n\n"
+            )
+        else:
+            trunc_note = ""
+
         prompt = (
             "You are a surgical file-patch engine.\n"
             "Given a file's contents and an edit instruction, produce the MINIMAL list of\n"
             "operations needed. Do NOT rewrite the whole file — only touch changed lines.\n\n"
             "OPERATION TYPES (a JSON array of these objects):\n"
-            '  {"op":"replace","old_text":"<exact existing text>","new_text":"<replacement>"}\n'
-            '  {"op":"insert","anchor":"<exact line text to insert AFTER>","new_text":"<new line(s)>"}\n'
-            '  {"op":"delete","target_text":"<exact text of line to delete>"}\n\n'
-            "RULES:\n"
-            "  1. old_text / anchor / target_text must be EXACT substrings from the file.\n"
-            "  2. new_text should include the newline character \\n at the end if needed.\n"
-            "  3. Prefer replace over delete+insert.\n"
-            "  4. Return [] if no changes are needed.\n"
-            "  5. CRITICAL: You MUST wrap your JSON array in a ```json fenced code block.\n"
-            "     CORRECT format (always do this):\n"
-            "     ```json\n"
-            "     [ {\"op\": \"insert\", ...} ]\n"
-            "     ```\n"
-            "  6. Inside JSON string values, all double-quotes MUST be escaped as \\\".\n"
-            "     For example: onclick=\\\"showMessage()\\\" not onclick=\"showMessage()\".\n"
-            "  7. No explanation or commentary outside the fenced block.\n\n"
+            '  {"op":"replace","old_text":"<exact multi-or-single line text>","new_text":"<replacement>"}\n'
+            '  {"op":"insert","anchor":"<exact substring of the line to insert AFTER>","new_text":"<new line(s)>"}\n'
+            '  {"op":"delete","target_text":"<exact substring of the line to delete>"}\n\n'
+            "CRITICAL RULES:\n"
+            "  1. old_text / anchor / target_text must be EXACT copy-paste from the file.\n"
+            "     Copy the text character-for-character including indentation and punctuation.\n"
+            "  2. For multi-line replacements, old_text must span the EXACT lines as shown\n"
+            "     including all newlines (\\n) between them.\n"
+            "  3. new_text must end with \\n unless it is the last line of the file.\n"
+            "  4. Prefer replace over delete+insert for changing existing code.\n"
+            "  5. Return [] if no changes are needed.\n"
+            "  6. MUST wrap output in ```json fenced block — no other text.\n"
+            "  7. Escape ALL double-quotes inside JSON string values as \\\"\n"
+            "  8. Escape ALL literal backslashes as \\\\.\n\n"
             f"FILE: {filepath}\n"
             f"INSTRUCTION: {instruction}\n\n"
+            f"{trunc_note}"
             f"FILE CONTENTS (line-numbered):\n{numbered}\n\n"
-            "Respond with ONLY a ```json fenced block containing the ops array:"
+            "Respond with ONLY a ```json fenced block:"
         )
+        return self._ask_and_parse(prompt)
+
+    def _plan_rewrite(self, filepath: str, content: str, instruction: str):
+        """Full-file rewrite fallback — returns a single rewrite op."""
+        # For very large files cap what we send
+        send_content = content if len(content) <= 20000 else content[:20000] + "\n... (truncated)"
+        prompt = (
+            "You are a file editor. Rewrite the ENTIRE file applying the instruction below.\n"
+            "Return ONLY a ```json fenced block with a single rewrite op:\n"
+            '  [{"op":"rewrite","new_content":"<complete new file content>"}]\n\n'
+            "RULES:\n"
+            "  1. new_content must be the COMPLETE new file — do not truncate.\n"
+            "  2. Escape ALL double-quotes as \\\" and backslashes as \\\\.\n"
+            "  3. No explanation outside the ```json block.\n\n"
+            f"FILE: {filepath}\n"
+            f"INSTRUCTION: {instruction}\n\n"
+            f"CURRENT FILE:\n{send_content}\n\n"
+            "Respond with ONLY a ```json fenced block:"
+        )
+        return self._ask_and_parse(prompt)
+
+    def _ask_and_parse(self, prompt: str):
+        """Send prompt to LLM and robustly extract a JSON array."""
         try:
             agent = FreeLLM(model=self.model)
             raw   = agent.ask(prompt).strip()
-            # ── Robust extraction: prefer fenced ```json block ──
+            # Prefer fenced ```json block
             fenced = re.search(r"```(?:json)?\s*\n?([\s\S]*?)```", raw)
             if fenced:
                 raw = fenced.group(1).strip()
             else:
-                # Fallback: strip any leading/trailing fence remnants
                 raw = re.sub(r"^```[a-z]*\n?", "", raw).strip()
                 raw = re.sub(r"\n?```$", "", raw).strip()
-            # Extract the JSON array even if there's surrounding text
+            # Extract the JSON array even if surrounded by stray text
             arr_match = re.search(r"(\[[\s\S]*\])", raw)
             if arr_match:
                 raw = arr_match.group(1)
@@ -1889,19 +1995,45 @@ class SmartFileEditor:
 
     # ── Op implementations ──────────────────────────────────────
     @staticmethod
-    def _op_replace(lines: list, old_text: str, new_text: str):
-        for i, line in enumerate(lines):
-            if old_text in line:
-                lines[i] = line.replace(old_text, new_text, 1)
-                return lines, True
-        return lines, False
+    def _op_replace_str(content: str, old_text: str, new_text: str):
+        """Exact string replacement across the whole file content."""
+        if old_text in content:
+            return content.replace(old_text, new_text, 1), True
+        return content, False
+
+    @staticmethod
+    def _op_replace_fuzzy(content: str, old_text: str, new_text: str):
+        """Whitespace-normalised fallback: collapse runs of spaces/newlines before
+        comparing, so minor LLM indentation mistakes still match."""
+        def _norm(s):
+            return re.sub(r"[ \t]+", " ", re.sub(r"\r\n|\r", "\n", s)).strip()
+        norm_content = _norm(content)
+        norm_old     = _norm(old_text)
+        if norm_old and norm_old in norm_content:
+            # Find the real start position in the original content
+            # by locating the first occurrence of the first non-blank word
+            first_word = re.search(r"\S+", old_text)
+            if first_word:
+                idx = content.find(first_word.group())
+                if idx != -1:
+                    # Find end by character count approximation
+                    end = idx + len(old_text)
+                    # Try to snap end to a line boundary
+                    nl = content.find("\n", end - 5)
+                    if nl != -1 and nl < end + 50:
+                        end = nl + 1
+                    return content[:idx] + new_text + content[end:], True
+        return content, False
 
     @staticmethod
     def _op_insert(lines: list, anchor: str, new_text: str):
         for i, line in enumerate(lines):
             if anchor in line:
-                new_lines = [nl if nl.endswith("\n") else nl + "\n"
-                             for nl in new_text.splitlines()] or [new_text]
+                new_lines = []
+                for nl in new_text.splitlines():
+                    new_lines.append(nl + "\n")
+                if not new_lines:
+                    new_lines = [new_text if new_text.endswith("\n") else new_text + "\n"]
                 lines[i+1:i+1] = new_lines
                 return lines, True
         return lines, False
@@ -3232,14 +3364,18 @@ LIVE SYSTEM:
 11. ADAPTIVE steps: if a step's command depends on the RESULT of a previous
     step (not just a file), make it type="python" so it can subprocess the
     prior result and decide what to run.{mcp_type_note}
-13. FILE EDITING — CRITICAL: When the task is to edit/modify/change/patch an
-    existing file, ALWAYS use type="smart_edit" instead of type="python".
-    smart_edit applies only the minimal necessary changes (line-level patches)
-    rather than rewriting the whole file.
+13. FILE EDITING — CRITICAL: When the task is to edit/modify/change/patch/add
+    to/remove from an EXISTING file, you MUST use type="smart_edit".
+    NEVER use type="command" or type="python" to edit an existing file.
+    smart_edit applies only the minimal necessary changes without rewriting.
     Format: {{"id": N, "type": "smart_edit", "command": "<absolute_file_path>",
-              "description": "<precise natural-language description of the change>",
+              "description": "<precise natural-language description of ALL changes needed>",
               "depends_on": []}}
-    Use type="python" ONLY when creating a NEW file or doing non-edit tasks.
+    BAD  : {{"type":"command","command":"snake_game_fixed.html"}}  ← NEVER do this
+    BAD  : {{"type":"python","command":"","description":"edit the html file"}}
+    GOOD : {{"type":"smart_edit","command":"/home/kali/Desktop/snake_game_fixed.html",
+              "description":"add speedMultiplier variable and boost logic"}}
+    Use type="python" ONLY when creating a NEW file from scratch or doing non-edit tasks.
 12. NEVER use 'cd' in shell commands — cd is a shell built-in and CANNOT be
     run as a standalone command or pre-flight step. Instead, ALWAYS use full
     absolute paths directly in every command. For example:
@@ -3271,7 +3407,7 @@ YOUR ENTIRE RESPONSE MUST BE EXACTLY THIS — NOTHING ELSE:
 }}}}
 ```
 
-type values: "command" | "python" | "mcp_call" | "info"
+type values: "command" | "python" | "smart_edit" | "mcp_call" | "info"
 warning: null or string (not the string "null")
         """).strip()
 
@@ -4545,6 +4681,113 @@ class ReconPipeline:
 # ══════════════════════════════════════════════════════════════
 # SECTION 19 — CLI INTERFACE
 # ══════════════════════════════════════════════════════════════
+
+# ── Smart completer: slash commands + annotated path completions ──
+if _PT_OK:
+    class _HackersCompleter(_PTCompleter):
+        """
+        Provides two completion modes:
+        • Slash commands  — triggered when text starts with '/'
+          Shows: /command  <description>
+        • Path completion — triggered when any token contains './', '../', '~/', or '/'
+          Shows: name  [dir] or [file] annotation on the right
+        """
+        _SLASH = {
+            "/help":    "Show commands",
+            "/clear":   "Clear history",
+            "/history": "Last messages",
+            "/profile": "System profile / memory / edit",
+            "/tools":   "List pentest tools",
+            "/sysinfo": "Live system info",
+            "/switch":  "Switch model",
+            "/target":  "Set sticky target",
+            "/auth":    "Authorize target",
+            "/shell":   "Drop to bash shell",
+            "/recon":   "Full recon pipeline",
+            "/note":    "Save target note",
+            "/notes":   "Show notes",
+            "/delnotes":"Delete notes",
+            "/save":    "Save session report",
+            "/dryrun":  "Toggle dry-run mode",
+            "/config":  "Edit MCP config",
+            "/telegram":"Configure Telegram remote",
+            "/mcp":     "MCP server control",
+            "/improve": "Update user profile from session",
+            "/exit":    "Save + exit",
+        }
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            word = document.get_word_before_cursor(WORD=True)
+
+            # ── Slash command completion ────────────────────────
+            if text.lstrip().startswith("/"):
+                typed = text.lstrip()
+                for cmd, desc in self._SLASH.items():
+                    if cmd.startswith(typed):
+                        yield _PTCompletion(
+                            cmd,
+                            start_position=-len(typed),
+                            display=cmd,
+                            display_meta=desc,
+                        )
+                return
+
+            # ── Path completion ─────────────────────────────────
+            _PATH_TRIGGERS = ("./", "../", "/", "~/", "~")
+            is_path = any(
+                word.startswith(t) for t in _PATH_TRIGGERS
+            ) or ("/" in word and not word.startswith("-"))
+
+            if not is_path:
+                return
+
+            # Expand to absolute path for listing
+            if word.startswith("~/") or word == "~":
+                base = os.path.expanduser(word)
+            elif word.startswith("/"):
+                base = word
+            else:
+                base = os.path.join(os.getcwd(), word)
+
+            # Split into directory and partial filename
+            if os.path.isdir(base):
+                dir_part  = base
+                file_part = ""
+            else:
+                dir_part  = os.path.dirname(base)
+                file_part = os.path.basename(base)
+
+            # Guard: dir must exist and be reachable before listing
+            if not dir_part:
+                dir_part = os.getcwd()
+            if not os.path.isdir(dir_part):
+                return
+            try:
+                entries = sorted(os.listdir(dir_part))
+            except OSError:
+                return
+
+            for entry in entries:
+                if file_part and not entry.startswith(file_part):
+                    continue
+                full   = os.path.join(dir_part, entry)
+                is_dir = os.path.isdir(full)
+                meta   = "[dir] " if is_dir else "[file]"
+                prefix    = word[: len(word) - len(file_part)]
+                completed = prefix + entry
+                if is_dir:
+                    completed += "/"
+                yield _PTCompletion(
+                    completed,
+                    start_position=-len(word),
+                    display=entry + ("/" if is_dir else ""),
+                    display_meta=meta,
+                )
+
+else:
+    _HackersCompleter = None  # type: ignore
+
 
 class CLI:
     GUI_COMMANDS = {
@@ -6058,9 +6301,65 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         _NAT_CMDS = {"recon","note","notes","save","dryrun","target","shell","auth","mcp","config"}
 
+        # ── prompt_toolkit session (rich completions + annotations) ──
+        _pt_session = None
+        if _PT_OK and _HackersCompleter is not None:
+            from prompt_toolkit.key_binding import KeyBindings as _PTKeyBindings
+            from prompt_toolkit.filters import completion_is_selected as _pt_sel
+
+            _kb = _PTKeyBindings()
+
+            @_kb.add("tab")
+            def _tab_accept(event):
+                """Tab: accept highlighted completion; if none highlighted yet,
+                move to first item so the next Tab accepts it."""
+                buf = event.app.current_buffer
+                if buf.complete_state:
+                    if buf.complete_state.current_completion is not None:
+                        buf.apply_completion(buf.complete_state.current_completion)
+                    else:
+                        buf.complete_next()
+                else:
+                    buf.start_completion(select_first=True)
+
+            @_kb.add("right", filter=_pt_sel)
+            def _right_accept(event):
+                """→ key: accept current completion when one is highlighted."""
+                buf = event.app.current_buffer
+                if buf.complete_state and buf.complete_state.current_completion is not None:
+                    buf.apply_completion(buf.complete_state.current_completion)
+
+            _pt_style = _PTStyle.from_dict({
+                "completion-menu.completion":              "bg:#1e1e2e #cdd6f4",
+                "completion-menu.completion.current":      "bg:#313244 #cba6f7 bold",
+                "completion-menu.meta.completion":         "bg:#1e1e2e #6c7086 italic",
+                "completion-menu.meta.completion.current": "bg:#313244 #7f849c italic",
+                "scrollbar.background":                    "bg:#313244",
+                "scrollbar.button":                        "bg:#89b4fa",
+            })
+            _pt_session = _PTSession(
+                completer=_HackersCompleter(),
+                style=_pt_style,
+                key_bindings=_kb,
+                complete_while_typing=True,
+                # Reserve 8 lines at the bottom so the dropdown floats above
+                # output and never obscures the last responses.
+                reserve_space_for_menu=8,
+            )
+
         while True:
             try:
-                user_input = input(self._get_prompt()).strip()
+                # Blank line before prompt — breathing room between AI output and input
+                print()
+                if _pt_session is not None:
+                    raw_prompt = self._get_prompt()
+                    # Strip readline non-printing markers (\x01/\x02 aka ^A/^B)
+                    # that _rl_wrap() adds — prompt_toolkit doesn't use them and
+                    # renders them literally, corrupting the terminal display.
+                    raw_prompt = raw_prompt.replace("\x01", "").replace("\x02", "")
+                    user_input = _pt_session.prompt(_PTANSI(raw_prompt)).strip()
+                else:
+                    user_input = input(self._get_prompt()).strip()
             except (EOFError, KeyboardInterrupt):
                 print(c("cyan", "\n\n  Goodbye.\n"))
                 self._shutdown(reason="⌨️ Session ended (Ctrl+C / EOF)")
