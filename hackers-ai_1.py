@@ -28,6 +28,20 @@ import select
 import urllib.request
 import urllib.error
 
+# ── Real user home (works correctly even when running under sudo) ──
+def _real_home() -> str:
+    """Return the invoking user's home directory even when running as root via sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd
+            return pwd.getpwnam(sudo_user).pw_dir
+        except Exception:
+            pass
+    return os.path.expanduser("~")
+
+_REAL_HOME = _real_home()
+
 # ── prompt_toolkit (optional — graceful fallback to input()) ──
 try:
     from prompt_toolkit import PromptSession as _PTSession
@@ -124,13 +138,44 @@ try:
     import readline as _rl
     import atexit as _atexit
 
-    _HIST_FILE = os.path.expanduser("~/.hackers_ai_history")
+    _HIST_FILE = os.path.join(_REAL_HOME, ".hackers_ai_history")
     _rl.set_history_length(1000)
+
+    # Fix ownership if the history file was previously created by root
+    # (happens when the script was run with sudo before this fix)
+    if os.path.exists(_HIST_FILE) and os.geteuid() == 0:
+        _sudo_user = os.environ.get("SUDO_USER")
+        if _sudo_user:
+            try:
+                import pwd as _pwd
+                _pw = _pwd.getpwnam(_sudo_user)
+                if os.stat(_HIST_FILE).st_uid == 0:  # owned by root — fix it
+                    os.chown(_HIST_FILE, _pw.pw_uid, _pw.pw_gid)
+            except Exception:
+                pass
+
     try:
         _rl.read_history_file(_HIST_FILE)
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         pass
-    _atexit.register(_rl.write_history_file, _HIST_FILE)
+
+    def _write_history():
+        try:
+            _rl.write_history_file(_HIST_FILE)
+            # Ensure the file is owned by the real user, not root
+            if os.geteuid() == 0:
+                _sudo_user = os.environ.get("SUDO_USER")
+                if _sudo_user:
+                    try:
+                        import pwd as _pwd
+                        _pw = _pwd.getpwnam(_sudo_user)
+                        os.chown(_HIST_FILE, _pw.pw_uid, _pw.pw_gid)
+                    except Exception:
+                        pass
+        except PermissionError:
+            pass
+
+    _atexit.register(_write_history)
 
     # Use emacs editing mode — this gives arrow-key history/movement for free
     # without double-binding that corrupts the terminal on rapid key presses.
@@ -156,7 +201,7 @@ except ImportError:
 # File: ~/.hackers_ai_profile.txt   (one fact per line, UTF-8)
 # ──────────────────────────────────────────────────────────────
 
-IMPROVE_PROFILE_PATH = os.path.expanduser("~/.hackers_ai_profile.txt")
+IMPROVE_PROFILE_PATH = os.path.join(_REAL_HOME, ".hackers_ai_profile.txt")
 
 class UserProfileImprover:
     """
@@ -439,7 +484,7 @@ class UserProfileImprover:
 # TELEGRAM NOTIFIER
 # ══════════════════════════════════════════════════════════════
 
-TELEGRAM_CONFIG_PATH = os.path.expanduser("~/.hackers_ai_telegram.json")
+TELEGRAM_CONFIG_PATH = os.path.join(_REAL_HOME, ".hackers_ai_telegram.json")
 
 def _tg_config_load() -> dict:
     if not os.path.exists(TELEGRAM_CONFIG_PATH):
@@ -975,8 +1020,8 @@ class FreeLLM:
 # SECTION 1 — CONSTANTS & CONFIG
 # ══════════════════════════════════════════════════════════════
 
-DB_PATH       = os.path.expanduser("~/.hackers_ai.db")
-MCP_CONFIG_PATH = os.path.expanduser("~/.hackers_ai_mcp.json")
+DB_PATH        = os.path.join(_REAL_HOME, ".hackers_ai.db")
+MCP_CONFIG_PATH = os.path.join(_REAL_HOME, ".hackers_ai_mcp.json")
 MAX_HISTORY   = 10
 MAX_RETRIES   = 3
 DEFAULT_MODEL = PROXY_MODEL
@@ -1043,11 +1088,17 @@ def _mcp_config_load() -> dict:
         return {"mcpServers": {}}
     try:
         with open(MCP_CONFIG_PATH, "r") as f:
-            data = json.load(f)
+            raw = f.read()
+        data = json.loads(raw)
         if not isinstance(data.get("mcpServers"), dict):
             data["mcpServers"] = {}
         return data
-    except Exception:
+    except json.JSONDecodeError as e:
+        print(c("red", f"  [MCP] Config file has invalid JSON: {e}"))
+        print(c("dim", f"  Fix it with: /config  (path: {MCP_CONFIG_PATH})"))
+        return {"mcpServers": {}}
+    except Exception as e:
+        print(c("red", f"  [MCP] Could not read config: {e}"))
         return {"mcpServers": {}}
 
 def _mcp_config_save(data: dict):
@@ -1413,7 +1464,7 @@ class ToolInspector:
         try:
             r = subprocess.run(["httpx", "--version"], capture_output=True, text=True, timeout=4)
             out = (r.stdout + r.stderr).lower()
-            if "projectdiscovery" in out or "httpx" in out and "next generation" not in out:
+            if "projectdiscovery" in out or ("httpx" in out and "next generation" not in out):
                 r2 = subprocess.run(["httpx", "-h"], capture_output=True, text=True, timeout=4)
                 h = (r2.stdout + r2.stderr).lower()
                 if "-title" in h or "-tech-detect" in h or "-status-code" in h:
@@ -2348,7 +2399,7 @@ class MCPStdioClient:
         self.args    = args or []
         self.env     = env or {}
         self._proc:  Optional[subprocess.Popen] = None
-        self._lock   = threading.Lock()
+        self._lock   = threading.RLock()
         self._req_id = 0
         self._tools_cache: Optional[list] = None
 
@@ -2423,7 +2474,9 @@ class MCPStdioClient:
                 if self._proc.poll() is not None:
                     stderr_out = ""
                     try:
-                        stderr_out = self._proc.stderr.read(2000).decode("utf-8", errors="replace")
+                        rr, _, _ = select.select([self._proc.stderr], [], [], 1.0)
+                        if rr:
+                            stderr_out = self._proc.stderr.read(2000).decode("utf-8", errors="replace")
                     except Exception:
                         pass
                     raise RuntimeError(
@@ -2478,14 +2531,12 @@ class MCPStdioClient:
         return result
 
     def ping(self) -> bool:
+        """Check if the server process is alive without sending any protocol messages."""
         try:
             self._start()
-            self.initialize()
-            return True
+            return self._proc is not None and self._proc.poll() is None
         except Exception:
             return False
-        finally:
-            pass  # Keep process alive for subsequent calls
 
     def list_tools(self, force_refresh: bool = False) -> list:
         if self._tools_cache is not None and not force_refresh:
@@ -3763,7 +3814,11 @@ class ExecutionEngine:
                     cmd   = step_item.get("command", "")
                     if not cmd and stype not in ("python", "mcp_call"):
                         return
-                    self._current_step_args = step_item.get("args") or {}
+                    # Each thread passes args through _run_with_healing via the step
+                    # directly — avoid writing to shared self._current_step_args to
+                    # prevent race conditions between parallel workers.
+                    with lk:
+                        self._current_step_args = step_item.get("args") or {}
                     result = self._run_with_healing(
                         cmd, stype, task_id, sid,
                         step_item.get("tool",""), label=f"S{sid}", lock=lk, desc=desc
@@ -3829,8 +3884,7 @@ class ExecutionEngine:
         return re.sub(r'(?<![A-Za-z0-9_])~(?=/|\s|$)', real_home, cmd)
 
     def _get_real_home(self) -> str:
-        sudo_user = os.environ.get("SUDO_USER")
-        return os.path.expanduser(f"~{sudo_user}") if sudo_user else os.path.expanduser("~")
+        return _REAL_HOME
 
     def _log(self, task_id, step_id, tool, cmd, stdout, status):
         self.memory.log_task_step(task_id, step_id, tool, cmd, stdout[:2000], status)
@@ -4856,7 +4910,7 @@ class CLI:
             self._improver.show()
 
         _sudo_user = os.environ.get("SUDO_USER")
-        self.cwd = os.path.expanduser(f"~{_sudo_user}") if _sudo_user else os.getcwd()
+        self.cwd = _REAL_HOME if _sudo_user else os.getcwd()
 
         self._check_proxy()
 
@@ -4941,8 +4995,7 @@ class CLI:
         try:
             _sudo_user = os.environ.get("SUDO_USER") or "root"
             _hostname  = self.profile.get("hostname", "kali") or "kali"
-            home = (os.path.expanduser(f"~{_sudo_user}") if os.environ.get("SUDO_USER")
-                    else os.path.expanduser("~"))
+            home = _REAL_HOME
             display = self.cwd
             if display == home:
                 display = "~"
@@ -5015,6 +5068,7 @@ class CLI:
                 ("Session",  ["/target","/auth","/shell","/save","/dryrun"]),
                 ("Recon",    ["/recon","/note","/notes","/delnotes"]),
                 ("MCP",      ["/config","/mcp"]),
+                ("Memory",   ["/improve"]),
                 ("Notify",   ["/telegram"]),
             ]
             for cat, keys in cats:
@@ -5250,6 +5304,10 @@ class CLI:
         if slug == "/telegram":
             return self._handle_telegram(arg)
 
+        if slug == "/improve":
+            self._improver.update(self.memory, verbose=True)
+            return True
+
         if slug == "/exit":
             print(c("cyan", "\n  [memory] Saving learned facts from this session..."))
             try:
@@ -5358,7 +5416,11 @@ class CLI:
             active  = self.memory.get_mcp_active_name()
             if not servers:
                 print(c("dim",  "\n  No MCP servers configured."))
-                print(c("dim",  "  Run /config to open the config file and add servers."))
+                print(c("dim",  f"  Config file: {MCP_CONFIG_PATH}"))
+                if not os.path.exists(MCP_CONFIG_PATH):
+                    print(c("yellow", "  (file does not exist yet — run /config to create it)"))
+                else:
+                    print(c("dim",  "  Run /config to edit it and add servers."))
                 print()
                 return True
             print()
@@ -5367,7 +5429,16 @@ class CLI:
             _mi = _box_inner(_mbw)
             for name, scfg in servers.items():
                 is_active = (name == active)
-                act_badge = c("green", "● ACTIVE") if is_active else c("dim", "○")
+                if is_active and self._mcp_client:
+                    # Check if the process is actually still alive
+                    if self._mcp_client._proc and self._mcp_client._proc.poll() is not None:
+                        act_badge = c("red", "● DEAD (run /mcp use to reconnect)")
+                    else:
+                        act_badge = c("green", "● ACTIVE")
+                elif is_active:
+                    act_badge = c("yellow", "● SAVED (not connected)")
+                else:
+                    act_badge = c("dim", "○")
                 cmd_str   = scfg.get("command", "?")
                 args      = scfg.get("args", [])
                 args_str  = " ".join(str(a) for a in args[:4])
@@ -5491,6 +5562,7 @@ class CLI:
         # ── tools [name] ──────────────────────────────────
         if sub_cmd == "tools":
             client = self._mcp_client
+            _temp_client = False
             if sub1:
                 # Show tools for a named server without switching active
                 cfg     = _mcp_config_load()
@@ -5499,12 +5571,14 @@ class CLI:
                     print(c("red", f"  Server '{sub1}' not found in config."))
                     return True
                 client = _mcp_client_from_config(sub1, servers[sub1])
+                _temp_client = True
                 print(c("dim", f"  Connecting to '{sub1}' for tool listing..."), end="", flush=True)
                 try:
                     client.initialize()
                     print(c("green", " ok"))
                 except Exception as e:
                     print(c("red", f" failed: {e}"))
+                    client._stop()
                     return True
             if not client:
                 print(c("yellow", "  No active MCP. Use /mcp use <name> first, or /mcp tools <name>."))
@@ -5512,6 +5586,8 @@ class CLI:
             tools = client.list_tools(force_refresh=True)
             if not tools:
                 print(c("yellow", "  No tools returned by this server."))
+                if _temp_client:
+                    client._stop()
                 return True
             srv_name = client.name
             print()
@@ -5538,6 +5614,8 @@ class CLI:
                     print(row)
             print(_box_bot(_stbw, "cyan"))
             print()
+            if _temp_client:
+                client._stop()
             return True
 
         # ── call <tool> [json_args] ───────────────────────
@@ -6034,9 +6112,7 @@ Output ONLY JSON lines. No explanation, no markdown.
 
     def _inject_profile_context(self):
         self.profile["cwd"] = self.cwd
-        _su = os.environ.get("SUDO_USER")
-        self.profile["real_home"] = (os.path.expanduser(f"~{_su}") if _su
-                                     else os.path.expanduser("~"))
+        self.profile["real_home"] = _REAL_HOME
         self.profile["sticky_target"] = self.sticky_target or "(none set)"
         # Inject learned user-profile facts so the planner can personalise responses
         self.profile["user_profile_facts"]    = self._improver.inject_into_prompt()
@@ -6240,13 +6316,13 @@ Output ONLY JSON lines. No explanation, no markdown.
 
         print(c("dim", "\n  [→] Summarizing..."))
         _task_end = time.time()
+        _elapsed  = _task_end - _task_start
         summary = Summarizer(model=self.model).summarize(raw, user_input, history, self.profile)
         self._print_response(summary)
         self.memory.add_message("user",      user_input, self.model)
         self.memory.add_message("assistant", summary,    self.model)
 
         # Telegram task-done notification (tasks only — informational handled above)
-        _elapsed = _task_end - _task_start if "_task_start" in locals() else 0
         if not getattr(self, "_tg_mode", False):
             self._tg.notify_task_done(user_input, summary, _elapsed)
 
@@ -6390,12 +6466,9 @@ Output ONLY JSON lines. No explanation, no markdown.
             if _first == "cd":
                 target = " ".join(_words[1:]).strip() if len(_words) > 1 else ""
                 if not target or target == "~":
-                    _su = os.environ.get("SUDO_USER")
-                    target = os.path.expanduser(f"~{_su}") if _su else os.path.expanduser("~")
+                    target = _REAL_HOME
                 elif target.startswith("~/"):
-                    _su = os.environ.get("SUDO_USER")
-                    home = os.path.expanduser(f"~{_su}") if _su else os.path.expanduser("~")
-                    target = os.path.join(home, target[2:])
+                    target = os.path.join(_REAL_HOME, target[2:])
                 elif not os.path.isabs(target):
                     target = os.path.normpath(os.path.join(self.cwd, target))
                 if os.path.isdir(target):
