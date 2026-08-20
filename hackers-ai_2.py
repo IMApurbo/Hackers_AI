@@ -1935,9 +1935,10 @@ class CommandExecutor:
                     + f"{icon_str} exit:{process.returncode} ({elapsed}s)"
                 )
                 _print(block)
-            else:
-                icon = c("green", "✓") if success else c("red", "✗")
-                _print(c("dim", f"  └─ {tag}{icon} exit:{process.returncode} ({elapsed}s)"))
+            elif not success:
+                # Success is silent — only surface a footer when something
+                # actually went wrong.
+                _print(c("red", f"  └─ {tag}✗ exit:{process.returncode} ({elapsed}s)"))
             return {
                 "command":    command,
                 "stdout":     "\n".join(stdout_lines),
@@ -3584,12 +3585,9 @@ def _run_tool_loop(cli: "CLI", messages: list, system: str, gate: "SafetyGate",
             idx = _store_tool_output(cli, result_text)
             if getattr(cli, "_tg_mode", False):
                 pass
-            elif name in _SKIP_PREVIEW_TOOLS:
-                # Already streamed live (and possibly capped there) — just point
-                # at the stored copy instead of re-printing it.
-                if len(result_text.splitlines()) > TOOL_OUTPUT_PREVIEW_LINES:
-                    print(c("dim", f"      (see /output {idx})"))
-            else:
+            elif name not in _SKIP_PREVIEW_TOOLS:
+                # run_shell already streamed (and possibly capped) its own
+                # output live — nothing more to print here for it.
                 _print_tool_output(result_text, idx)
             tool_results.append({
                 "type": "tool_result", "tool_use_id": tid,
