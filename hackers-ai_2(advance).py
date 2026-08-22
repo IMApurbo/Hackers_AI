@@ -5245,34 +5245,47 @@ Output ONLY JSON lines. No explanation, no markdown.
     def run(self):
         self._print_banner()
 
-        # Known shell commands — used only to qualify _cmd_only check below.
-        # These must be a single recognisable binary name with flag/path args only.
-        _DIRECT_CMDS = {
-            "ls","ll","la","l","pwd","cat","head","tail","less","more",
-            "echo","ps","top","htop","df","du","free","uname","whoami",
-            "id","env","printenv","date","uptime","w","who","last",
-            "find","grep","awk","sed","cut","sort","uniq","wc","tr",
-            "mkdir","rmdir","rm","cp","mv","touch","chmod","chown","ln",
-            "which","whereis","type","file","stat","lsof","netstat","ss",
-            "ip","ifconfig","route","arp","ping","traceroute","nslookup",
-            "dig","host","curl","wget","tree","lsblk","mount","umount",
-            "systemctl","service","journalctl","dmesg","lscpu",
-            "tar","zip","unzip","gzip","gunzip","nc","ncat","ssh","scp",
-            "nano","vim","vi","nvim","python3","python","node","php",
-            "ruby","bash","sh","zsh","clear","reset","tee",
-            "base64","xxd","hexdump","strings","objdump","readelf",
-            "strace","ltrace","ldd","nm","diff","patch",
-            "nmap","sqlmap","hydra","gobuster","ffuf","wfuzz","nikto",
-            "aircrack-ng","hashcat","john","msfconsole","msfvenom",
-        }
-
+        # Natural-language slash-aliases — typing these bare words still routes
+        # to their /command handler (e.g. "shell" -> "/shell"), since that's a
+        # deliberate command invocation, not a chat message.
         _NAT_CMDS = {"recon","note","notes","save","dryrun","target","shell","auth","mcp","config"}
+
+        # ── Paste collapsing (Claude-Code-style) ─────────────────────
+        # A large/multi-line paste is shown as a short placeholder like
+        # "[Pasted text: 42 lines, 310 words #1]" instead of dumping the
+        # whole blob into the prompt line. Backspacing right after the
+        # placeholder deletes the whole thing in one step (and forgets the
+        # underlying text). Placeholders are expanded back to the real text
+        # right before the line is handed off to command/chat processing.
+        _PASTE_LINE_THRESHOLD = 4          # collapse if pasted text has > N lines...
+        _PASTE_CHAR_THRESHOLD = 400        # ...or is longer than N chars
+        _paste_store: dict = {}
+        _paste_counter = {"n": 0}
+        _PASTE_RE = re.compile(r"\[Pasted text: \d+ lines?, \d+ words? #(\d+)\]")
+
+        def _make_placeholder(text: str) -> str:
+            _paste_counter["n"] += 1
+            pid = _paste_counter["n"]
+            lines = text.count("\n") + 1
+            words = len(text.split())
+            placeholder = (
+                f"[Pasted text: {lines} line{'s' if lines != 1 else ''}, "
+                f"{words} word{'s' if words != 1 else ''} #{pid}]"
+            )
+            _paste_store[placeholder] = text
+            return placeholder
+
+        def _expand_pastes(s: str) -> str:
+            for placeholder, text in _paste_store.items():
+                s = s.replace(placeholder, text)
+            return s
 
         # ── prompt_toolkit session (rich completions + annotations) ──
         _pt_session = None
         if _PT_OK and _HackersCompleter is not None:
             from prompt_toolkit.key_binding import KeyBindings as _PTKeyBindings
             from prompt_toolkit.filters import completion_is_selected as _pt_sel
+            from prompt_toolkit.keys import Keys as _PTKeys
 
             _kb = _PTKeyBindings()
 
@@ -5295,6 +5308,32 @@ Output ONLY JSON lines. No explanation, no markdown.
                 buf = event.app.current_buffer
                 if buf.complete_state and buf.complete_state.current_completion is not None:
                     buf.apply_completion(buf.complete_state.current_completion)
+
+            @_kb.add(_PTKeys.BracketedPaste)
+            def _handle_bracketed_paste(event):
+                """Collapse a real terminal paste into a short placeholder
+                instead of inserting the raw pasted text."""
+                data = event.data or ""
+                buf = event.app.current_buffer
+                if (data.count("\n") + 1) > _PASTE_LINE_THRESHOLD or len(data) > _PASTE_CHAR_THRESHOLD:
+                    buf.insert_text(_make_placeholder(data))
+                else:
+                    buf.insert_text(data)
+
+            @_kb.add("backspace")
+            def _handle_backspace(event):
+                """Backspace right after a paste placeholder deletes the
+                whole placeholder (and the pasted text it stands for) in
+                one step, instead of eating it character by character."""
+                buf = event.app.current_buffer
+                before = buf.document.text_before_cursor
+                m = _PASTE_RE.search(before)
+                if m and m.end() == len(before):
+                    placeholder = m.group(0)
+                    buf.delete_before_cursor(count=len(placeholder))
+                    _paste_store.pop(placeholder, None)
+                else:
+                    buf.delete_before_cursor(count=1)
 
             _pt_style = _PTStyle.from_dict({
                 "completion-menu.completion":              "bg:#1e1e2e #cdd6f4",
@@ -5335,6 +5374,12 @@ Output ONLY JSON lines. No explanation, no markdown.
             if not user_input:
                 continue
 
+            # Expand any paste placeholders back into their real text now
+            # that we know the full line — everything downstream (slash
+            # commands, /shell aliasing, chat processing) sees the real
+            # pasted content, only the on-screen prompt line stayed short.
+            user_input = _expand_pastes(user_input)
+
             if user_input.startswith("/"):
                 if not self._handle_slash(user_input):
                     print(c("red", f"  Unknown command: {user_input}. Type /help."))
@@ -5362,61 +5407,13 @@ Output ONLY JSON lines. No explanation, no markdown.
                     print(c("red", f"  cd: {target}: No such directory"))
                 continue
 
-            # ── Direct shell execution rules ───────────────────────
-            # Rule 1: unambiguous shell syntax → always direct
-            _shell_syntax = (
-                "|"  in user_input
-                or ">>" in user_input
-                or ">"  in user_input
-                or "<"  in user_input
-                or user_input.strip().startswith("./")
-                or user_input.strip().startswith("sudo ")
-            )
-
-            # Rule 2: known command where every token is a flag, path, number,
-            # or a bare word used as a flag-value (right after a flag like -name).
-            # Any standalone plain English word → NL instruction, not a shell cmd.
-            def _is_shell_invocation(words):
-                prev_was_flag = False
-                for tok in words[1:]:
-                    if tok.startswith("-"):
-                        prev_was_flag = True
-                        continue
-                    if prev_was_flag:          # bare word as flag-value: -name passwd
-                        prev_was_flag = False
-                        continue
-                    prev_was_flag = False
-                    # standalone token: must look like a path / number / glob
-                    if tok.startswith("/"):    continue
-                    if tok.startswith("~"):    continue
-                    if tok.startswith("$"):    continue
-                    if tok.startswith("."):    continue
-                    if re.match(r"^\d", tok): continue
-                    if re.match(r"^[*?]", tok):continue
-                    if "=" in tok:             continue
-                    if "/" in tok or "." in tok: continue
-                    return False   # plain English word → treat as instruction
-                return True
-
-            _cmd_only = (
-                _first in _DIRECT_CMDS
-                and len(_words) <= 8
-                and _is_shell_invocation(_words)
-            )
-
-            _is_direct = _shell_syntax or _cmd_only
-
-            if _is_direct:
-                ex   = CommandExecutor()
-                _cmd = user_input.strip()
-                if _first in self.GUI_COMMANDS or self.run_as_user:
-                    _cmd = CommandExecutor.as_user(_cmd)
-                res = ex.run(_cmd, timeout=60, cwd=self.cwd)
-                self.memory.add_message("user", user_input, self.model)
-                self.memory.add_message("assistant",
-                    res.get("stdout","") or res.get("stderr",""), self.model)
-                continue
-
+            # ── Chat-only input ─────────────────────────────────────
+            # Nothing typed at the bare prompt is ever executed directly on
+            # the system anymore, no matter what it looks like (pipes,
+            # redirects, "sudo ...", a bare binary name, etc). Everything
+            # goes to the chat/model pipeline. The ONLY way to get a real
+            # interactive system shell is the explicit "/shell" command
+            # handled above (and by _NAT_CMDS -> "/shell").
             try:
                 self.process(user_input)
             except KeyboardInterrupt:
